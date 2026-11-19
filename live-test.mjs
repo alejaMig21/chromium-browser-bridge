@@ -446,7 +446,6 @@ try {
   // ---- ticket 10: two stand-in Edge profiles, both running the current extension (instance id and tab title for real) ----
   {
     const here = dirname(fileURLToPath(import.meta.url));
-    const killFolder = folder => { try { execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${folder.replaceAll('\\', '*')}*' -and $_.CommandLine -notlike '*--type=*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }`], { stdio: 'ignore' }); } catch { /* none left */ } };
     const startSession = async n => { const c = new Client({ name: `live-test-mb-${n}`, version: '1' }); const t = new StdioClientTransport({ command: process.execPath, args: [join(here, 'server.mjs')], env: { ...serverEnv, CLAUDE_BROWSER_TMP: join(tmp, `server-tmp-mb-${n}`), BROWSER_IDLE_MS: '0' }, stderr: 'pipe' }); t.stderr.on('data', () => {}); extraClients.push(c); await c.connect(t); return callOn(c); };
     const poll = async (fn, okFn, tries = 40) => { let r; for (let i = 0; i < tries; i++) { r = await fn(); if (okFn(r)) break; await new Promise(x => setTimeout(x, 500)); } return r; };
     const nameOf = (text, title) => new RegExp(`^- ([\\w.-]+?)(?: \\(id [\\w-]+\\))?:[^\\n]*active tab: "${title}"`, 'm').exec(text)?.[1];
@@ -483,14 +482,14 @@ try {
     ok('10 the switched session now works in B', (await call('get_page_text')).text.length > 0 && !(await call('tabs_context_mcp')).err);
 
     // Closing A: its session is told what was lost and what is left; the sessions on B keep working.
-    killFolder(join(tmp, 'user-browser'));
+    killRun(join(tmp, 'user-browser'));
     const lost = await poll(() => s3('tabs_context_mcp'), r => r.err);
     ok('10 closing a browser tells its session which one went and which are still connected', lost.err && new RegExp(`${nameA} disconnected\\. Still connected: ${nameB.split('-')[0]}\\.`).test(lost.text), lost.text);
     ok('10 the sessions on the other browser keep working', (await s2('get_page_text')).text.includes('second page') && !(await call('tabs_context_mcp')).err);
     const left = await poll(() => call('list_connected_browsers'), r => /Connected browsers \(1\)/.test(r.text));
     ok('10 the list shows only the browser that is left', /Connected browsers \(1\)/.test(left.text) && left.text.includes(nameB.split('-')[0]) && !left.text.includes(nameA), left.text);
     await s3('browser_close'); await s2('browser_close'); await call('browser_close');
-    killFolder(join(tmp, 'second-profile'));
+    killRun(join(tmp, 'second-profile'));
   }
   try { execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '${userPat}' -and $_.CommandLine -notlike '*--type=*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }`], { stdio: 'ignore' }); } catch { /* cleaned in finally too */ }
   }

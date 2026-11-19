@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkUrl, loadPolicy } from './policy.mjs';
 import { brokerClient, choiceNote, describeBrowsers } from './broker-client.mjs';
-import { installGuide, defaultBrowserProgram } from './platform.mjs';
+import { installGuide, defaultBrowserProgram, matchBrowsers } from './platform.mjs';
 import { resolveBrowser, launchArgs, startBrowser, findBrowserPid, waitForCdp, waitForPage, cdpUp, isOwned, ownership, killOwned, loadState, saveState, clearState } from './launcher.mjs';
 
 const { GIFEncoder, quantize, applyPalette } = gifenc;
@@ -437,7 +437,7 @@ reg('browser_attach', "Attach to the browser the user ALREADY has open (their re
   if (unsupported) throw new Error(installGuide(browser, '')); // no point waiting for an extension that cannot exist
   // Attaching again must not renumber the tabs or move the work tab: a live attachment is kept as it is.
   // Naming another browser is a switch, not a repeat: it falls through, and disconnect() below releases this session's tabs in the first one.
-  if (attachedWs && work && !work.isClosed() && (!browser || attachedName.includes(browser.toLowerCase())) && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
+  if (attachedWs && work && !work.isClosed() && (!browser || matchBrowsers(browser, [{ name: attachedName }]).length) && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
   let picked;
   try { picked = await broker.chooseBrowser({ browser, waitMs: Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000) }); }
   catch (e) {
@@ -456,6 +456,7 @@ reg('browser_attach', "Attach to the browser the user ALREADY has open (their re
 });
 reg('browser_launch', 'Start a browser with a dedicated profile and a local debug port, then connect to it. If one already answers on that port, just attach. headless=true opens no window. For a browser the user already has open, use browser_attach instead.', { browser: z.string().optional().describe('vivaldi (default), chrome, edge, brave, or a path to a Chromium exe'), headless: z.boolean().optional(), port: z.number().optional() }, async args => {
   attachedWs = null;
+  attachedName = '';
   const r = await start(args);
   cdp = r.endpoint;
   await disconnect();
@@ -510,6 +511,7 @@ reg('browser_close', 'Disconnect, and close the browser if this tool launched it
   const wasAttached = !!attachedWs;
   await disconnect();
   attachedWs = null;
+  attachedName = '';
   if (wasAttached) { broker.close(); return "Detached from the user's own browser, which was left running untouched."; } // lets an idle broker stop
   const s = loadState(cdpPort());
   if (!s) return 'Disconnected. This tool did not launch that browser, so it was left running.';
