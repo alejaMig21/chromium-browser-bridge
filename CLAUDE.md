@@ -1,4 +1,4 @@
-# local-claude-browser-manager
+# chromium-browser-bridge
 
 MCP server (`server.mjs`) that mirrors the Claude in Chrome tool set (computer, navigate, read_page, find, form_input, get_page_text, javascript_tool, tabs_*, console/network readers, resize_window, gif_creator, upload_image, file_upload, browser_batch) over CDP. It needs no Claude extension and no Claude account, because the CLI only trusts an extension signed in to the same account.
 

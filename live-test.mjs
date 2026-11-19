@@ -30,7 +30,7 @@ const base = `http://127.0.0.1:${srv.address().port}/`;
 const BRIDGE_PORT = 9341; // not the real bridge port 9340, so a real extension never talks to a test server
 const PORT = 9301; // not the default 9333, so a browser the user has open is never touched
 // All test residue lives under one root, removed on every exit path (see finally).
-const liveRoot = join(tmpdir(), 'live-tests', 'local-claude-browser-manager');
+const liveRoot = join(tmpdir(), 'live-tests', 'chromium-browser-bridge');
 mkdirSync(liveRoot, { recursive: true });
 // Stop every process whose command line carries this exact folder (a run's browsers and broker all do), never anything else.
 const killRun = folder => { try { execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${folder.replaceAll('\\', '*')}*' -and $_.CommandLine -notlike '*--type=*' -and $_.Name -match '^(node|msedge|chrome|vivaldi|brave)\.exe$' -and $_.ProcessId -ne $PID } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }`], { stdio: 'ignore' }); } catch { /* none left */ } };
