@@ -1,5 +1,5 @@
 {
-  "name": "local-claude-browser-manager",
+  "name": "chromium-browser-bridge",
   "private": true,
   "license": "MIT",
   "type": "module",
