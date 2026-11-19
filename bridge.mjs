@@ -8,6 +8,7 @@ import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { win32 } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
+import { programOfConnection } from './platform.mjs';
 
 // Fixed by the "key" in extension/manifest.json, so the origin of its socket can be checked.
 export const EXTENSION_ID = 'nbjcgjmkbnkpjjkglddgcmmnknfdeade';
@@ -15,8 +16,8 @@ const SESSION_ID = /^[\w-]{1,64}$/;
 const usable = ts => ts.filter(t => /^https?:|^about:blank$/.test(t.url || ''));
 
 // identify({ req, remoteAddress, remotePort }) answers which program (a file path) opened an extension connection, or nothing
-// when it cannot tell: that entry is then named "browser". Replaceable so tests inject names and the Windows lookup plugs in.
-export function startBridge({ port = 9340, log = () => {}, captureMs = {}, identify = () => undefined } = {}) {
+// when it cannot tell: that entry is then named "browser". Replaceable so tests inject names and the Windows lookup (platform.mjs) is the default.
+export function startBridge({ port = 9340, log = () => {}, captureMs = {}, identify = programOfConnection } = {}) {
   const CAP = { real: 8000, nudgeEvery: 500, nudge: 1000, shown: 8000, ...captureMs }; // deadlines of the capture steps (ms)
   const NOT_PAINTED = 'The browser paints nothing for this tab right now: it is in the background, or another window is covering the browser window, or the window is minimized (a browser cannot paint what nobody can see). Read the page with get_page_text or read_page, or ask the user to bring the browser window to the front. BROWSER_REVEAL_TABS=1 lets this tool show the tab for a moment instead, at the price of a flicker.';
   const token = randomBytes(16).toString('hex');

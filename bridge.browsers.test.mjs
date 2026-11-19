@@ -106,7 +106,7 @@ test('a legacy extension (no id) is one entry named after its program; a second 
 });
 
 test('with the default component every entry is named browser and one browser works with no argument', async () => {
-  const solo = startBridge({ port: PORT + 10 });
+  const solo = startBridge({ port: PORT + 10, identify: () => undefined }); // a component that cannot tell (the real one is the default now)
   await solo.listening;
   const ws = new WebSocket(`ws://127.0.0.1:${PORT + 10}/extension`, { headers: { Origin: `chrome-extension://${EXTENSION_ID}` } });
   ws.on('message', d => { const { id, method } = JSON.parse(d.toString()); ws.send(JSON.stringify({ id, result: method === 'chrome.tabs.query' ? [] : null })); });

@@ -2,6 +2,7 @@
 // Linux can all be tested from any machine. Pure functions answer "where" and "which command"; killTree is the only
 // one that acts, and it takes the way to run a command and to send a signal as parameters too.
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 
 export const BROWSER_NAMES = ['chrome', 'edge', 'brave', 'opera', 'vivaldi', 'chromium'];
@@ -92,4 +93,31 @@ export const pickBrowserPid = (processes, name, port) => processes.find(({ cmd }
 export async function killTree(pid, { platform = process.platform, run, kill = process.kill.bind(process) } = {}) {
   if (platform === 'win32') return run('taskkill', ['/PID', String(pid), '/T', '/F']);
   try { kill(-pid, 'SIGTERM'); } catch { kill(pid, 'SIGTERM'); }
+}
+
+// The pid on the client side of a loopback connection, from `netstat -ano -p tcp` text: the row whose local port is the
+// client's port and whose foreign port is the server's (the listener's own row has the two the other way round).
+export function ownerPid(text, clientPort, serverPort) {
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const m = /^\s*TCP\s+\S+:(\d+)\s+\S+:(\d+)\s+\S+\s+(\d+)\s*$/.exec(line);
+    if (m && Number(m[1]) === Number(clientPort) && Number(m[2]) === Number(serverPort)) return Number(m[3]);
+  }
+}
+
+const runCommand = (file, args) => new Promise((resolve, reject) =>
+  execFile(file, args, { windowsHide: true, timeout: 2000 }, (err, out) => (err ? reject(err) : resolve(String(out)))));
+
+// Which program opened a connection to the bridge: its executable's full path, or nothing. Windows only (netstat for the
+// owning pid, one PowerShell call for the path, about half a second). Any failure, or no answer within timeoutMs, is nothing.
+export async function programOfConnection({ req, remoteAddress, remotePort }, { run = runCommand, timeoutMs = 2000, platform = process.platform } = {}) {
+  if (platform !== 'win32' || !remotePort || !/^(::ffff:)?127\./.test(remoteAddress ?? '') && remoteAddress !== '::1') return undefined;
+  let timer;
+  const lookup = (async () => {
+    const pid = ownerPid(await run('netstat', ['-ano', '-p', 'tcp']), remotePort, req.socket.localPort);
+    if (!pid) return undefined;
+    const out = await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).Path`]);
+    return out.trim() || undefined;
+  })().catch(() => undefined);
+  const bound = new Promise(r => { timer = setTimeout(r, timeoutMs, undefined); });
+  try { return await Promise.race([lookup, bound]); } finally { clearTimeout(timer); }
 }
