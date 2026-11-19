@@ -319,8 +319,10 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     ws.on('close', () => {
       if (e.ext !== ws) return; // a replaced socket must not fail the new connection's calls
       e.ext = null;
+      const lost = nameOf(e); // named while it is still listed: its name may carry an instance suffix
       if (entries.get(e.key) === e) entries.delete(e.key);
-      for (const s of e.sessions()) s.ws.close(1000, 'extension disconnected');
+      // Only this browser's sessions end; the reason says which browser went away and which are left (a close reason is at most 123 bytes).
+      for (const s of e.sessions()) s.ws.close(1000, `${lost} disconnected. Still connected: ${names() || 'none'}`.slice(0, 120));
       for (const p of e.pending.values()) p.reject(new Error('The browser extension disconnected.'));
       e.pending.clear();
     });
