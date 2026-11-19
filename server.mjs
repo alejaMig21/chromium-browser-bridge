@@ -12,8 +12,8 @@ import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkUrl, loadPolicy } from './policy.mjs';
-import { brokerClient } from './broker-client.mjs';
-import { installGuide } from './platform.mjs';
+import { brokerClient, choiceNote, describeBrowsers } from './broker-client.mjs';
+import { installGuide, defaultBrowserProgram, matchBrowsers } from './platform.mjs';
 import { resolveBrowser, launchArgs, startBrowser, findBrowserPid, waitForCdp, waitForPage, cdpUp, isOwned, ownership, killOwned, loadState, saveState, clearState } from './launcher.mjs';
 
 const { GIFEncoder, quantize, applyPalette } = gifenc;
@@ -22,10 +22,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 const policy = loadPolicy(process.env.BROWSER_POLICY ?? join(here, 'policy.json'));
 let cdp = process.env.CDP_ENDPOINT ?? 'http://127.0.0.1:9333';
 let attachedWs = null; // set while attached to a browser the user already had open (never launched or closed by us)
+let attachedName = ''; // the connected-browser name that attachment went to
 // The Local Browser Bridge extension, installed once in the user's own browser, connects here.
 const SESSION_ID = randomUUID(); // this MCP server's identity on the bridge
 // Every Claude session's MCP server shares one broker that owns the bridge port; it is started on first use.
-const broker = brokerClient({ sessionId: SESSION_ID, port: Number(process.env.BROWSER_BRIDGE_PORT ?? 9340), log: (...a) => console.error('[broker-client]', ...a) });
+const broker = brokerClient({ sessionId: SESSION_ID, port: Number(process.env.BROWSER_BRIDGE_PORT ?? 9340), defaultBrowser: defaultBrowserProgram, log: (...a) => console.error('[broker-client]', ...a) });
 const OUT = process.env.BROWSER_OUTPUT ?? join(here, 'output');
 // Everything this server (and the browsers it launches) writes to the temp dir lives under ONE root.
 // Leftovers older than a day are dropped on start; Playwright's per-connection folders on every disconnect and exit.
@@ -85,6 +86,8 @@ async function doTrack(page) {
 }
 
 async function connect() {
+  // A browser that is gone gets its answer from the broker's list: Playwright waits out its whole timeout on a socket the broker closes at once.
+  if (attachedWs) { const gone = await lostBrowserNote(); if (gone) throw new Error(`${gone} Call browser_attach again.`); }
   // The user's own browser may ask them to approve the connection, so give them a minute to answer.
   const browser = await chromium.connectOverCDP(attachedWs ?? cdp, { timeout: attachedWs ? 60000 : 10000 }).catch(e => {
     throw new Error(attachedWs
@@ -237,7 +240,8 @@ function reg(name, description, shape, fn) {
     } catch (e) {
       // The broker (and with it the browser connection) can die under a running call: say what to do.
       const lost = attachedWs && /Target (page, context or browser )?(has been )?closed|Connection closed|browser has been closed/i.test(String(e.message));
-      return { isError: true, content: [{ type: 'text', text: String(e.message ?? e) + (lost ? ' The connection to the browser broker was lost; call browser_attach again.' : '') }] };
+      const gone = lost ? await lostBrowserNote() : '';
+      return { isError: true, content: [{ type: 'text', text: String(e.message ?? e) + (gone ? ` ${gone} Call browser_attach again.` : lost ? ' The connection to the browser broker was lost; call browser_attach again.' : '') }] };
     }
     finally { inflight--; touch(); }
   });
@@ -428,23 +432,31 @@ async function start({ browser = 'vivaldi', headless = false, port = 9333 }) {
   return { endpoint, launched: true, name };
 }
 
-reg('browser_attach', "Attach to the browser the user ALREADY has open (their real profile, tabs and logins) through the Local Browser Bridge extension. Needs that extension installed once in their browser; after that there are no prompts and no accounts. Works on one work tab, the tab the user is looking at when you attach; it stays your default when they switch tabs or minimize the browser (tabs_context_mcp marks it; pass tabId to act on another). The browser is never launched, restarted or closed by this tool, and the user's tabs are never navigated away by it. Optional browser (chrome, edge, brave, opera, vivaldi, chromium) tailors the install help if the extension is missing.", { browser: z.string().optional() }, async ({ browser }) => {
+reg('browser_attach', "Attach to the browser the user ALREADY has open (their real profile, tabs and logins) through the Local Browser Bridge extension. Needs that extension installed once in their browser; after that there are no prompts and no accounts. Works on one work tab, the tab the user is looking at when you attach; it stays your default when they switch tabs or minimize the browser (tabs_context_mcp marks it; pass tabId to act on another). The browser is never launched, restarted or closed by this tool, and the user's tabs are never navigated away by it. Optional browser (chrome, edge, brave, opera, vivaldi, chromium) picks which connected browser to attach when several are open (without it: the only connected one, else the system default if connected, else this fails and lists them), and tailors the install help if that browser is not connected. The reply names the browser and how it was chosen.", { browser: z.string().optional() }, async ({ browser }) => {
   const unsupported = browser && /not supported/.test(installGuide(browser, ''));
   if (unsupported) throw new Error(installGuide(browser, '')); // no point waiting for an extension that cannot exist
   // Attaching again must not renumber the tabs or move the work tab: a live attachment is kept as it is.
-  if (attachedWs && work && !work.isClosed() && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
-  if (!await broker.waitForExtension(Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000))) throw new Error(`${installGuide(browser, join(here, 'extension'))} If it is installed, make sure the browser is open and this server is running, then call browser_attach again.`);
+  // Naming another browser is a switch, not a repeat: it falls through, and disconnect() below releases this session's tabs in the first one.
+  if (attachedWs && work && !work.isClosed() && (!browser || matchBrowsers(browser, [{ name: attachedName }]).length) && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
+  let picked;
+  try { picked = await broker.chooseBrowser({ browser, waitMs: Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000) }); }
+  catch (e) {
+    if (!e.notConnected) throw e;
+    throw new Error(`${e.connected.length ? `${e.message} ` : ''}${installGuide(browser, join(here, 'extension'))} If it is installed, make sure the browser is open and this server is running, then call browser_attach again.`);
+  }
   await disconnect();
+  attachedName = picked.name;
   attachedWs = broker.cdpEndpoint();
   let c;
   try { c = await connect(); } catch (e) { attachedWs = null; throw e; }
   const mine = c.pages().filter(p => !p.isClosed());
-  if (!mine.length) return "Attached to the user's own browser, but this session has no tab yet: the tab they are looking at is in use by another Claude session, or it is a browser page (new-tab page, settings) that is never touched. Open your own with tabs_create_mcp. This tool will not close the browser.";
+  if (!mine.length) return `${choiceNote(picked)} Attached to the user's own browser, but this session has no tab yet: the tab they are looking at is in use by another Claude session, or it is a browser page (new-tab page, settings) that is never touched. Open your own with tabs_create_mcp. This tool will not close the browser.`;
   work = await visiblePage(mine);
-  return `Attached to the user's own browser. Tabs in play: ${c.pages().length}. Work tab: the one the user was looking at; it stays the default when they switch tabs. This tool will not close it.`;
+  return `${choiceNote(picked)} Attached to the user's own browser. Tabs in play: ${c.pages().length}. Work tab: the one the user was looking at; it stays the default when they switch tabs. This tool will not close it.`;
 });
 reg('browser_launch', 'Start a browser with a dedicated profile and a local debug port, then connect to it. If one already answers on that port, just attach. headless=true opens no window. For a browser the user already has open, use browser_attach instead.', { browser: z.string().optional().describe('vivaldi (default), chrome, edge, brave, or a path to a Chromium exe'), headless: z.boolean().optional(), port: z.number().optional() }, async args => {
   attachedWs = null;
+  attachedName = '';
   const r = await start(args);
   cdp = r.endpoint;
   await disconnect();
@@ -452,10 +464,18 @@ reg('browser_launch', 'Start a browser with a dedicated profile and a local debu
   return `${r.launched ? `Launched ${r.name}${args.headless ? ' (headless)' : ''}` : 'Attached to the browser already running'} on ${cdp}. Tabs: ${c.pages().length}.`;
 });
 reg('browser_status', 'Report whether a browser answers on the debug port, whether this server is connected, and whether this tool launched it.', {}, async () => {
-  const v = await cdpUp(cdp), s = loadState(cdpPort());
-  if (attachedWs) return JSON.stringify({ mode: 'attached to the user\'s own browser', connected: !!ctx && !!curBrowser?.isConnected(), tabs: ctx?.pages().length ?? 0, debuggerAttached: !!ctx && ctx.pages().length > 0, launchedByThisTool: false, idleCloseSeconds: IDLE_MS / 1000, broker: await broker.status() }, null, 2);
-  return JSON.stringify({ endpoint: cdp, reachable: !!v, browser: v?.Browser ?? null, connected: !!ctx, tabs: ctx?.pages().length ?? 0, launchedByThisTool: !!s && await isOwned(s, here), idleCloseSeconds: IDLE_MS / 1000 }, null, 2);
+  const v = await cdpUp(cdp), s = loadState(cdpPort()), connectedBrowsers = describeBrowsers(await broker.browsers());
+  if (attachedWs) return JSON.stringify({ mode: 'attached to the user\'s own browser', connected: !!ctx && !!curBrowser?.isConnected(), tabs: ctx?.pages().length ?? 0, debuggerAttached: !!ctx && ctx.pages().length > 0, launchedByThisTool: false, idleCloseSeconds: IDLE_MS / 1000, broker: await broker.status(), connectedBrowsers }, null, 2);
+  return JSON.stringify({ endpoint: cdp, reachable: !!v, browser: v?.Browser ?? null, connected: !!ctx, tabs: ctx?.pages().length ?? 0, launchedByThisTool: !!s && await isOwned(s, here), idleCloseSeconds: IDLE_MS / 1000, connectedBrowsers }, null, 2);
 });
+reg('list_connected_browsers', 'List the browsers connected through the Local Browser Bridge extension: name, program path, instance id when several share a name, active tab title, and whether a session is using it. Read-only: opens no tab and attaches nothing, so it works before browser_attach. Use it to see what browser_attach can pick from.', {}, async () => describeBrowsers(await broker.browsers()));
+// Playwright hides the close reason the broker gives when this session's browser goes away, so say it from the broker's own list:
+// empty unless the connection really dropped, the broker is still up and no longer lists the browser this session was attached to.
+async function lostBrowserNote() {
+  if (!attachedName || curBrowser?.isConnected()) return '';
+  const alive = (await broker.status()).uptimeMs !== undefined, names = (await broker.browsers()).map(b => b.name);
+  return alive && !names.includes(attachedName) ? `${attachedName} disconnected. Still connected: ${names.join(', ') || 'none'}.` : '';
+}
 // A live round-trip, because a wedged Playwright connection still reports itself as connected.
 async function healthy() {
   if (!ctx || !curBrowser?.isConnected() || !(attachedWs || await cdpUp(cdp))) return false;
@@ -491,6 +511,7 @@ reg('browser_close', 'Disconnect, and close the browser if this tool launched it
   const wasAttached = !!attachedWs;
   await disconnect();
   attachedWs = null;
+  attachedName = '';
   if (wasAttached) { broker.close(); return "Detached from the user's own browser, which was left running untouched."; } // lets an idle broker stop
   const s = loadState(cdpPort());
   if (!s) return 'Disconnected. This tool did not launch that browser, so it was left running.';

@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Local Browser Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lets the local browser-cdp MCP server drive the tab you are looking at through chrome.debugger. Talks only to 127.0.0.1; no account, no network.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvIj00TnO/qR8KoTepypBCzeEINJngbmvgyfq34EBu/MYUavGU5lKxiAj3Lo2/l/nfJpjeQy7XGDCTOkzuwK3CVuRHwVk+NXMxpnJOljKmx/riYMSTraQ5XAPOobAsAV2MIYfZSiDOGavuSbsHBuIMAVTp78XYuBP5BBebLV4H6BP8V5d+k9L9muA+BF07HKE0IciZkzDSv+zUsgRfQicrWRLHJMiPVqTabZdSCmPkr1sbu8FPD0GZ0Bmo3h4BqqMbeiZzgMAIaLNut6XCNE4ZFbVjBey+eFG6MMg1alIFjgVWxtM93w3/ghM8yXuf/U1Du2YazA2OwVQEyApp2ZpmQIDAQAB",
-  "permissions": ["debugger", "tabs", "alarms"],
+  "permissions": ["debugger", "tabs", "alarms", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "bg.js" }
 }

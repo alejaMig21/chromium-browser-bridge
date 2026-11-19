@@ -33,10 +33,27 @@ const API = {
 };
 const ours = new Map(); // tab id -> until: an activation the agent itself caused, which is not the user switching tabs
 
-function connect() {
-  if (ws && ws.readyState <= WebSocket.OPEN) return;
-  ws = new WebSocket(`ws://127.0.0.1:${PORT}/extension`);
+// Random id of this browser profile, made once and kept: two profiles of one browser are told apart by it, and a restarted
+// service worker reconnects as the same entry. Announced on every connect as /extension?i=<id>.
+const instanceId = chrome.storage.local.get('instance').then(async ({ instance }) => {
+  if (instance) return instance;
+  instance = crypto.randomUUID();
+  await chrome.storage.local.set({ instance });
+  return instance;
+});
+
+// The title of the tab the user is looking at, so the broker can tell two entries of one browser apart in its list.
+const sendTitle = async () => {
+  const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  send({ method: 'extension.title', params: [usable(t) ? t.title || '' : ''] });
+};
+
+async function connect() {
+  const instance = await instanceId;
+  if (ws && ws.readyState <= WebSocket.OPEN) return; // checked after the await: two callers cannot both open a socket
+  ws = new WebSocket(`ws://127.0.0.1:${PORT}/extension?i=${instance}`);
   ws.onopen = async () => {
+    sendTitle();
     // Offer the tab(s) the user is looking at right now; the server attaches lazily.
     for (const t of await chrome.tabs.query({ active: true })) if (usable(t)) send({ method: 'chrome.tabs.onActivated', params: [slim(t)] });
     send({ method: 'extension.initialized' });
@@ -54,7 +71,10 @@ chrome.debugger.onEvent.addListener((source, method, params) => send({ method: '
 chrome.debugger.onDetach.addListener((source, reason) => send({ method: 'chrome.debugger.onDetach', params: [source, reason] }));
 chrome.tabs.onRemoved.addListener(tabId => send({ method: 'chrome.tabs.onRemoved', params: [tabId] }));
 chrome.tabs.onCreated.addListener(t => { if (usable(t)) send({ method: 'chrome.tabs.onCreated', params: [slim(t)] }); });
+chrome.windows.onFocusChanged.addListener(() => sendTitle()); // the active tab is another one when the user moves to another window
+chrome.tabs.onUpdated.addListener((_id, change, t) => { if (change.title && t.active) sendTitle(); });
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  sendTitle();
   const mine = ours.get(tabId);
   ours.delete(tabId);
   if (mine && Date.now() < mine) return;

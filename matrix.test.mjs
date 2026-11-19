@@ -4,18 +4,24 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BEHAVIOURS, runMatrix, writeResults } from './matrix.mjs';
+import { BEHAVIOURS, runMatrix, writeResults, makeDrive } from './matrix.mjs';
 
 const png = (w, h) => { const b = Buffer.alloc(24); b.writeUInt32BE(w, 16); b.writeUInt32BE(h, 20); return b; };
 // A fake browser that behaves like a healthy Chromium: every tool answers the way the real one does.
-function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', 'Chromium', 'Google Chrome'] } = {}) {
-  const used = [];
+// `connected`: the browsers the broker reports; browser_attach picks the one asked for (or lands on `attachesTo` when set).
+function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', 'Chromium', 'Google Chrome'], connected = ['chrome', 'edge', 'brave', 'opera', 'vivaldi'], attachesTo } = {}) {
+  const used = [], attached = [];
   let clicked = 0;
   const call = async (name, args = {}) => {
     used.push(args.action ? `${name}:${args.action}` : name);
     const ok = (text, extra = {}) => ({ err: false, text, images: 0, ...extra });
     switch (name) {
-      case 'browser_attach': return ok('Attached to the user\'s own browser. Tabs in play: 1.');
+      case 'browser_attach': {
+        attached.push(args.browser);
+        if (args.browser && !connected.includes(args.browser)) return { err: true, text: `Browser "${args.browser}" is not connected. Connected: ${connected.join(', ')}.`, images: 0 };
+        return ok(`Browser: ${attachesTo ?? args.browser ?? connected[0]} (${args.browser ? 'requested' : 'only one connected'}). Attached to the user's own browser. Tabs in play: 1.`);
+      }
+      case 'list_connected_browsers': return ok(`Connected browsers (${connected.length}):\n${connected.map(n => `- ${n}: x`).join('\n')}`);
       case 'tabs_create_mcp': return ok(`Created tab 7 at ${args.url}`);
       case 'tabs_close_mcp': return ok('Closed tab 7');
       case 'get_page_text': return ok(`Title: matrix\nURL: x\n---\nMATRIX-PAGE clicked ${clicked}`);
@@ -38,7 +44,7 @@ function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', '
     }
     return { err: true, text: `unexpected tool ${name}`, images: 0 };
   };
-  return { call, used };
+  return { call, used, attached };
 }
 const allYes = async () => 'y';
 
@@ -76,6 +82,31 @@ test('the run is refused, and filed as a failure, when the attached browser is n
   assert.match(bad.evidence, /Google Chrome/);
   assert.ok(!rows.some(r => r.behaviour === 'read'), 'nothing else ran against the wrong browser');
   assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for'], 'rows measured on the wrong browser are not filed under this name');
+});
+
+test('the run chooses its browser with browser_attach and the failure text no longer tells to close the other browsers', async () => {
+  const f = fakeBrowser();
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'chrome' });
+  assert.deepEqual(f.attached, ['chrome']);
+  assert.equal(rows.find(r => r.behaviour === 'attach').result, 'pass');
+  const bad = (await runMatrix({ call: fakeBrowser().call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'edge' })).find(r => r.behaviour === 'attached browser is the one asked for');
+  assert.doesNotMatch(bad.evidence, /one browser at a time|close the other|disable their extension/i);
+});
+
+test('a browser that is not connected is a refused run with the connected list, and nothing else is filed', async () => {
+  const f = fakeBrowser({ connected: ['chrome', 'edge'] });
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'vivaldi' });
+  assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for']);
+  assert.equal(rows[0].result, 'fail');
+  assert.match(rows[0].evidence, /vivaldi.*not connected.*chrome, edge/);
+  assert.ok(!f.used.includes('tabs_create_mcp'), 'no tab was opened');
+});
+
+test('results are never filed for a browser other than the one attached', async () => {
+  const f = fakeBrowser({ attachesTo: 'edge' });
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'chrome' });
+  assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for']);
+  assert.match(rows[0].evidence, /asked for chrome.*attached to edge/);
 });
 
 test('the browser asked for is recognised by its brand: Chrome, Edge, Brave, Opera, and Vivaldi (which announces only Chromium)', async () => {
@@ -120,6 +151,26 @@ test('with a drive, nothing is asked and every row is run by the runner, minimiz
   assert.deepEqual(asked, []);
   assert.deepEqual(d.log, ['minimize', 'restore', 'switch', 'second', 'closeSecond']);
   assert.deepEqual(rows.filter(r => r.result !== 'pass').map(r => `${r.behaviour}: ${r.result} ${r.evidence}`), []);
+});
+
+test('with a drive, the steps that reach the browser are told which connected browser the attach chose', async () => {
+  const seen = [];
+  const d = fakeDrive({ switchTabs: async name => { seen.push(['switch', name]); return { ok: true }; }, secondSession: async name => { seen.push(['second', name]); return { ok: true, evidence: 'ok' }; } });
+  await runMatrix({ call: fakeBrowser({ attachesTo: 'chrome-3f9a' }).call, ask: async () => 'y', base: 'http://127.0.0.1:1/', drive: d });
+  assert.deepEqual(seen, [['switch', 'chrome-3f9a'], ['second', 'chrome-3f9a']]);
+});
+
+// The real drive's way to the broker, with the broker client and the second MCP session replaced.
+test('the real drive sends the browser to its control channel and to the second session\'s attach', async () => {
+  const made = [], calls = [];
+  const makeBroker = opts => { made.push(opts); return { tabs: async () => [{ id: 3 }], reveal: async () => ({}), hide: async () => {}, status: async () => ({ sessions: 2, connected: true }) }; };
+  const second = { call: async (name, args) => { calls.push([name, args]); return { err: false, text: name === 'tabs_create_mcp' ? 'Created tab 9' : 'MATRIX-PAGE' }; }, client: { close: async () => {} } };
+  const d = await makeDrive({ browser: 'chrome', connect: async () => second, base: 'http://127.0.0.1:1/', makeBroker });
+  assert.equal((await d.switchTabs('chrome-3f9a')).ok, true);
+  assert.deepEqual(made.map(o => [o.sessionId, o.browser]), [['matrix-drive', 'chrome-3f9a']]);
+  assert.equal((await d.secondSession('chrome-3f9a')).ok, true);
+  assert.deepEqual(calls[0], ['browser_attach', { browser: 'chrome-3f9a' }]);
+  assert.equal(made.length, 1, 'one control client for the whole run');
 });
 
 test('with a drive, a window that cannot be minimized skips that row with the reason and still restores nothing', async () => {

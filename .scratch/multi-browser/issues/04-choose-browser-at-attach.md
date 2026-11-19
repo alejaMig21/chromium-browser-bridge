@@ -4,7 +4,7 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 Spec: stories 2, 3, 4, 6, 7, 8, 21, 22 in `.scratch/multi-browser/spec.md`.
 
@@ -15,3 +15,7 @@ Spec: stories 2, 3, 4, 6, 7, 8, 21, 22 in `.scratch/multi-browser/spec.md`.
 - [ ] A requested browser that is not connected and a young broker: waits and succeeds if it appears within 35 seconds, fails with the list otherwise (short deadlines injected in tests)
 - [ ] The same request with an old broker fails immediately with the list and the install guide
 - [ ] Two sessions attached to two different browsers work at the same time
+
+## Answer
+
+Done (commit ef831a6). `chooseBrowser({ browser, waitMs, graceMs })` in `broker-client.mjs`, called by `browser_attach` in `server.mjs`; `cdpEndpoint()` appends `&b=<chosen name>`. Reply prefix: `Browser: <name> (requested).` / `(the only one connected).` / `(the system default browser).` followed by the unchanged text. `defaultBrowser` is an option of `brokerClient({ ..., defaultBrowser })`: a function returning a program name or nothing, matched against connected names (exact, then substring); a throw, nothing or no match means unknown and the call fails listing the connected browsers. `server.mjs` passes none yet (ticket 05 wires it). Broker age: the existing `status` reply `uptimeMs` is read against `graceMs` (default 45000); the wait is `waitMs` (default 35000, env `BROWSER_EXT_WAIT_MS`). A requested browser that is not connected throws `notConnected` with the list and `server.mjs` appends the install guide; several connected with no usable default, or a name matching several, fail at once with the list. 9 new tests in `broker-client.choose.test.mjs` (port 9420).

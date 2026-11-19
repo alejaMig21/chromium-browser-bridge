@@ -30,19 +30,28 @@ export async function runMatrix({ call, ask, base, drive, browser, installedMajo
   const text = r => r.text ?? '';
   const COVERED = /covering the browser window/; // the bridge's plain message when a covered window paints nothing
 
-  await auto('attach', async () => { const r = await call('browser_attach'); return [!r.err, text(r)]; });
+  let attachedTo; // the connected browser browser_attach says it chose: "Browser: <name> (requested)..."
+  await auto('attach', async () => { const r = await call('browser_attach', browser ? { browser } : {}); attachedTo = /^Browser: (\S+)/.exec(text(r))?.[1]; return [!r.err, text(r)]; });
+  if (browser && rows[0].result === 'fail') { // not connected: refused, with what is connected, and nothing else is filed
+    const listed = text(await call('list_connected_browsers').catch(() => ({})));
+    rows.length = 0;
+    const names = [...listed.matchAll(/^- (\S+?)(?: \(id \S+\))?:/gm)].map(m => m[1]);
+    row('attached browser is the one asked for', 'fail', `asked for ${browser}, but it is not connected. ${names.length ? `Connected: ${names.join(', ')}` : 'No browser is connected'}.`);
+    return rows;
+  }
   let tabId;
   await auto('create tab with URL', async () => { const r = await call('tabs_create_mcp', { url: base }); tabId = /Created tab (\d+)/.exec(text(r))?.[1]; return [!r.err && !!tabId, text(r)]; });
   rows.userAgent = text(await call('javascript_tool', { text: 'navigator.userAgent' }).catch(() => ({})));
-  if (browser) { // several browsers can have the extension, but the broker serves one: never file results under the wrong name
+  if (browser) { // never file results under the wrong name: the attached browser must be the one asked for
     const brands = JSON.parse(text(await call('javascript_tool', { text: 'JSON.stringify((navigator.userAgentData?.brands ?? []).map(b => b.brand))' }).catch(() => ({}))) || '[]');
     // Vivaldi announces itself as "Google Chrome", so for browsers whose product version is their Chromium version the
     // attached browser's Chromium major must also equal the installed program's.
     const uaMajor = Number(/Chrome\/(\d+)/.exec(rows.userAgent)?.[1]);
     const wrongVersion = installedMajor && uaMajor && uaMajor !== installedMajor;
-    if (!isBrowser(browser, brands) || wrongVersion) {
+    const otherName = attachedTo && !attachedTo.toLowerCase().includes(browser.toLowerCase());
+    if (otherName || !isBrowser(browser, brands) || wrongVersion) {
       rows.length = 0; // what was measured so far belongs to another browser
-      row('attached browser is the one asked for', 'fail', `asked for ${browser}, but ${wrongVersion ? `the attached browser runs Chromium ${uaMajor} and the installed ${browser} is ${installedMajor}: it is another browser (Vivaldi announces itself as Google Chrome)` : `the extension that holds the bridge belongs to: ${brands.join(', ')}`}. The broker serves one browser at a time: close the other browsers or disable their extension, then run again`);
+      row('attached browser is the one asked for', 'fail', `asked for ${browser}, but ${otherName ? `it attached to ${attachedTo}` : wrongVersion ? `the attached browser runs Chromium ${uaMajor} and the installed ${browser} is ${installedMajor}: it is another browser (Vivaldi announces itself as Google Chrome)` : `the attached browser announces: ${brands.join(', ')}`}`);
       if (tabId) await call('tabs_close_mcp', { tabId: Number(tabId) }).catch(() => {});
       await call('browser_close').catch(() => {});
       return rows;
@@ -87,8 +96,8 @@ export async function runMatrix({ call, ask, base, drive, browser, installedMajo
     let minimized = false;
     await step('screenshot while minimized', async () => { const m = await drive.minimize(); minimized = m.ok; return m; }, minimizedShot);
     if (minimized) await drive.restore();
-    await step('tab switch keeps work tab', () => drive.switchTabs(base), async a => { const [ok, ev] = await workTabRead(); return [ok, `${a.note ?? 'tabs switched'}; ${ev}`]; });
-    await step('two sessions', () => drive.secondSession(base), async a => { const [ok, ev] = await workTabRead(); return [a.ok && ok, `${a.evidence}; first session: ${ev}`]; });
+    await step('tab switch keeps work tab', () => drive.switchTabs(attachedTo), async a => { const [ok, ev] = await workTabRead(); return [ok, `${a.note ?? 'tabs switched'}; ${ev}`]; });
+    await step('two sessions', () => drive.secondSession(attachedTo), async a => { const [ok, ev] = await workTabRead(); return [a.ok && ok, `${a.evidence}; first session: ${ev}`]; });
     await step('broker survives the starter closing', () => drive.closeSecond(), async a => { const r = await call('get_page_text'); return [a.ok && !r.err, `${a.evidence}; first session: ${text(r)}`]; });
   } else {
     await manual('screenshot while minimized', 'Minimize the browser window now, then press Enter (type skip to skip).', minimizedShot);
@@ -117,14 +126,16 @@ export function writeResults(rows, { browser, version, system, file, date = new 
 // extension APIs (no mouse, no keys, nothing takes focus): the window is minimized and put back right behind the window that
 // was in front, tabs are switched with the extension's reveal/hide (the steps a capture of a background tab uses), and the
 // second session is a second MCP server process on the same broker.
-async function makeDrive({ browser, connect, base }) {
+export async function makeDrive({ browser, connect, base, makeBroker }) {
   const { execFile } = await import('node:child_process');
   const { readFileSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { fileURLToPath } = await import('node:url');
   const { brokerClient, defaultDir } = await import('./broker-client.mjs');
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const broker = brokerClient({ sessionId: 'matrix-drive' });
+  // The control channel must name the browser the attach chose ("chrome-3f9a"), or it fails when several are connected.
+  let control;
+  const broker = attachedTo => (control ??= (makeBroker ?? brokerClient)({ sessionId: 'matrix-drive', browser: attachedTo ?? browser }));
   const procName = { vivaldi: 'vivaldi', chrome: 'chrome', edge: 'msedge', brave: 'brave', opera: 'opera' }[browser] ?? browser;
   const script = join(fileURLToPath(new URL('.', import.meta.url)), 'matrix-window.ps1');
   const ps = (action, behind = 0) => new Promise(res => execFile('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Action', action, '-Name', procName, '-Behind', String(behind)], { windowsHide: true }, (err, out) => { try { res(JSON.parse(out)); } catch { res({ ok: false, note: String(err?.message ?? out).slice(0, 120) }); } }));
@@ -142,22 +153,22 @@ async function makeDrive({ browser, connect, base }) {
       return { ok: true };
     },
     async restore() { if (minimized) { await ps('restore', behind); minimized = false; await sleep(400); } },
-    async switchTabs() {
-      const [tab] = await broker.tabs(base.replace(/\/$/, '')); // only the matrix's own tab is asked for
+    async switchTabs(attachedTo) {
+      const [tab] = await broker(attachedTo).tabs(base.replace(/\/$/, '')); // only the matrix's own tab is asked for
       if (!tab) return { ok: false, skip: true, note: 'the matrix tab was not found among the browser tabs' };
-      const shown = await broker.reveal(tab.id); // the browser activates the matrix tab, as if the user had switched to it
+      const shown = await broker(attachedTo).reveal(tab.id); // the browser activates the matrix tab, as if the user had switched to it
       await sleep(700);
-      await broker.hide(shown); // and back to the tab the user was on
+      await broker(attachedTo).hide(shown); // and back to the tab the user was on
       return { ok: true, note: `browser tab ${tab.id} was activated and the user's tab put back (through the extension's reveal/hide, so the bridge is not told it was the user)` };
     },
-    async secondSession() {
+    async secondSession(attachedTo) {
       second = await connect();
-      const att = await second.call('browser_attach');
+      const att = await second.call('browser_attach', attachedTo ?? browser ? { browser: attachedTo ?? browser } : {});
       const created = await second.call('tabs_create_mcp', { url: `${base}?second` });
       const id = /Created tab (\d+)/.exec(created.text)?.[1];
       second.tabId = id && Number(id);
       const read = id ? await second.call('get_page_text', { tabId: second.tabId }) : created;
-      const st = await broker.status();
+      const st = await broker(attachedTo).status();
       return { ok: !att.err && !created.err && /MATRIX-PAGE/.test(read.text), evidence: `second session: attach ${att.err ? 'failed' : 'ok'}, own tab ${id ?? 'none'}, read ${/MATRIX-PAGE/.test(read.text) ? 'ok' : read.text.slice(0, 60)}; broker sessions ${st.sessions}` };
     },
     async closeSecond() {
@@ -167,13 +178,13 @@ async function makeDrive({ browser, connect, base }) {
       await second.client.close().catch(() => {}); // the process of the second session ends, as when its Claude session is closed
       second = null;
       await sleep(1500);
-      const st = await broker.status();
+      const st = await broker().status();
       return { ok: !!pid && alive(pid) && st.connected === true, evidence: `closed the second session; broker pid ${pid} ${pid && alive(pid) ? 'still alive' : 'GONE'}, up ${Math.round((st.uptimeMs ?? 0) / 1000)} s (it may predate this run, so the closed session need not be the one that started it)` };
     },
     async cleanup() {
       await this.restore();
       if (second) { if (second.tabId) await second.call('tabs_close_mcp', { tabId: second.tabId }).catch(() => {}); await second.client.close().catch(() => {}); }
-      broker.close();
+      control?.close();
     },
   };
 }

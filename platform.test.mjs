@@ -1,7 +1,7 @@
 // The platform layer answers for Windows, macOS and Linux from any machine: the platform is a parameter.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BROWSER_NAMES, installGuide, browserPaths, discoveryDir, extensionsPage, parseProcessList, listCommand, commandLineCommand, killTree, pickBrowserPid } from './platform.mjs';
+import { BROWSER_NAMES, installGuide, browserPaths, discoveryDir, extensionsPage, parseProcessList, listCommand, commandLineCommand, killTree, pickBrowserPid, regValue, programFromCommand, defaultBrowserProgram, matchBrowsers } from './platform.mjs';
 
 test('every supported browser has a place to look on every system', () => {
   for (const p of ['win32', 'darwin', 'linux'])
@@ -97,4 +97,66 @@ test('stopping a process tree: taskkill on Windows, the process group then the p
   const second = [];
   await killTree(8, { platform: 'darwin', run: () => {}, kill: (pid, sig) => { second.push(pid); if (pid < 0) throw new Error('ESRCH'); } });
   assert.deepEqual(second, [-8, 8], 'falls back to the pid when it leads no process group');
+});
+
+// ---- system default browser (Windows) ----
+const USER_CHOICE = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice\r\n    Hash    REG_SZ    abc/DEF=\r\n    ProgId    REG_SZ    VivaldiHTM.QWERTY123\r\n\r\n';
+const OPEN_CMD = 'HKEY_CLASSES_ROOT\\VivaldiHTM.QWERTY123\\shell\\open\\command\r\n    (Default)    REG_SZ    "C:\\Users\\me\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe" -- "%1"\r\n\r\n';
+
+test('regValue reads one named value from reg query text', () => {
+  assert.equal(regValue(USER_CHOICE, 'ProgId'), 'VivaldiHTM.QWERTY123');
+  assert.equal(regValue(OPEN_CMD, '(Default)'), '"C:\\Users\\me\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe" -- "%1"');
+  assert.equal(regValue('ERROR: The system was unable to find the specified registry key or value.', 'ProgId'), undefined);
+});
+
+test('programFromCommand gives the lower-case executable name without extension', () => {
+  assert.equal(programFromCommand('"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --single-argument %1'), 'chrome');
+  assert.equal(programFromCommand('C:\\Windows\\msedge.EXE -url %1'), 'msedge');
+  assert.equal(programFromCommand('"C:\\Users\\me\\Vivaldi\\vivaldi.exe" -- "%1"'), 'vivaldi');
+  assert.equal(programFromCommand(''), undefined);
+  assert.equal(programFromCommand(undefined), undefined);
+});
+
+test('defaultBrowserProgram follows UserChoice then the ProgId open command', async () => {
+  const calls = [];
+  const run = async (file, args) => { calls.push(args.join(' ')); return /UserChoice/.test(args.join(' ')) ? USER_CHOICE : OPEN_CMD; };
+  assert.equal(await defaultBrowserProgram({ run, platform: 'win32' }), 'vivaldi');
+  assert.match(calls[1], /VivaldiHTM\.QWERTY123\\shell\\open\\command/);
+});
+
+test('defaultBrowserProgram returns nothing off Windows, on a missing key, a failure or a timeout', async () => {
+  const never = async () => { throw new Error('must not run'); };
+  assert.equal(await defaultBrowserProgram({ run: never, platform: 'linux' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: async () => { throw new Error('key not found'); }, platform: 'win32' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: async () => 'garbage', platform: 'win32' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: () => new Promise(() => {}), platform: 'win32', timeoutMs: 50 }), undefined);
+});
+
+test('defaultBrowserProgram reads a real answer on this Windows machine', { skip: process.platform !== 'win32' }, async () => {
+  const p = await defaultBrowserProgram();
+  assert.ok(p === undefined || (typeof p === 'string' && p.length > 0 && p === p.toLowerCase())); // whatever this host's default is
+});
+
+// ---- one name matcher for the broker, its client and the MCP server ----
+const rows = [{ name: 'chrome-3f9a', base: 'chrome', instance: '3f9a1b2c-0000' }, { name: 'chrome-bbbb', base: 'chrome', instance: 'bbbb2222' }, { name: 'msedge', base: 'msedge' }];
+const names = (want, list = rows, opts) => matchBrowsers(want, list, opts).map(r => r.name);
+
+test('matchBrowsers: the exact name or program name first, then the name that contains it', () => {
+  assert.deepEqual(names('msedge'), ['msedge']);
+  assert.deepEqual(names('EDGE'), ['msedge']);
+  assert.deepEqual(names('chrome'), ['chrome-3f9a', 'chrome-bbbb']); // the program name is exact for both: ambiguous, not "none"
+  assert.deepEqual(names('brave'), []);
+});
+
+test('matchBrowsers: name-xxxx still finds its entry when the suffix is no longer displayed', () => {
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome', instance: '3f9a1b2c-0000' }]), ['chrome']);
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome', instance: 'bbbb2222' }]), []);
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome' }]), []); // a legacy entry has no id to match
+});
+
+test('matchBrowsers with exactOnly never picks a name that merely contains the request', () => {
+  const list = [{ name: 'chromehelper' }, { name: 'msedge' }];
+  assert.deepEqual(names('chrome', list), ['chromehelper']);
+  assert.deepEqual(names('chrome', list, { exactOnly: true }), []);
+  assert.deepEqual(names('msedge', list, { exactOnly: true }), ['msedge']);
 });

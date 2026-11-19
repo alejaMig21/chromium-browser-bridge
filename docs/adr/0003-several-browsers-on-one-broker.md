@@ -27,3 +27,7 @@ A browser cannot be named reliably by what it says about itself: Vivaldi announc
 - The extension must be updated and reloaded once to announce its instance id; until then it behaves as before.
 - Tab ownership is per browser: a tab id is only unique inside one browser.
 - Not covered yet: operating systems other than Windows for reading the connecting program, and a name chosen by the user for each profile.
+
+Update 2026-11-19: the message is `<name> disconnected. Still connected: <names or none>` (the broker gives it as the close reason; Playwright hides that reason, so `server.mjs` rebuilds the same sentence from the broker's list when a tool fails because the connection dropped). `browser_attach` with another browser switches a session and releases its tabs in the first.
+
+Update 2026-11-19 (review): one matcher (`matchBrowsers` in `platform.mjs`) serves the broker, its client and the MCP server. A request matches the listed name or program name exactly, or `<program>-<first characters of the instance id>` even when the suffix is no longer listed (the sibling profile left), else a name that contains it; the system default browser is matched by exact program name only, so `chromehelper` is never `chrome`. A request that several entries match is refused as ambiguous, with the matches listed. Replacing a silent entry fails the calls still waiting on it at once.
