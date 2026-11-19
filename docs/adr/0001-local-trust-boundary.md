@@ -19,4 +19,4 @@ The bridge listens on `127.0.0.1:9340`. Two clients: the extension (`/extension`
 
 Update 2026-11-18: the per-process token part is superseded by ADR 0002 (token now lives in the broker discovery file).
 
-Update 2026-11-19: the single extension slot is superseded by ADR 0003 (one entry per connected browser; a live entry is still never replaced by a different program).
+Update 2026-11-19: the single extension slot is superseded by ADR 0003 (one entry per connected browser). "A live connection is never replaced" is revised: a live entry (seen in the last 45 s) is replaced at once by a connection with the same instance id from the same program (a service worker restart); a different program claiming a live id is refused and logged; a silent entry (over 45 s) can be replaced by anyone. A legacy extension with no id keeps the old rule.

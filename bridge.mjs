@@ -17,7 +17,7 @@ const usable = ts => ts.filter(t => /^https?:|^about:blank$/.test(t.url || ''));
 
 // identify({ req, remoteAddress, remotePort }) answers which program (a file path) opened an extension connection, or nothing
 // when it cannot tell: that entry is then named "browser". Replaceable so tests inject names and the Windows lookup (platform.mjs) is the default.
-export function startBridge({ port = 9340, log = () => {}, captureMs = {}, identify = programOfConnection } = {}) {
+export function startBridge({ port = 9340, log = () => {}, captureMs = {}, identify = programOfConnection, staleMs = 45000 } = {}) {
   const CAP = { real: 8000, nudgeEvery: 500, nudge: 1000, shown: 8000, ...captureMs }; // deadlines of the capture steps (ms)
   const NOT_PAINTED = 'The browser paints nothing for this tab right now: it is in the background, or another window is covering the browser window, or the window is minimized (a browser cannot paint what nobody can see). Read the page with get_page_text or read_page, or ask the user to bring the browser window to the front. BROWSER_REVEAL_TABS=1 lets this tool show the tab for a moment instead, at the price of a flicker.';
   const token = randomBytes(16).toString('hex');
@@ -254,6 +254,7 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     const { owners } = entry, mine = entry.sessions();
     switch (method) {
       case 'chrome.tabs.onCreated': claimOpened(entry, params?.[0]); break;
+      case 'extension.title': if (typeof params?.[0] === 'string') entry.title = params[0].slice(0, 200); break; // the active tab's title, for the browser list
       case 'chrome.tabs.onActivated': {
         const [tab] = params ?? [];
         if (!tab) break;
@@ -289,8 +290,15 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
   function onExtension(ws, program, instance) {
     const fresh = makeEntry(program, instance);
     const e = entries.get(fresh.key) ?? fresh;
-    if (e.ext?.readyState === WebSocket.OPEN && Date.now() - e.extSeen < 45000) return ws.close(1008, 'extension already connected');
+    // A live entry is replaced only by the same instance id from the same program (a service worker restart); a legacy
+    // extension has no id to prove anything, and another program claiming a live id is refused and logged.
+    if (e.ext?.readyState === WebSocket.OPEN && Date.now() - e.extSeen < staleMs && (!instance || e.program !== program)) {
+      log(`refused an extension connection claiming ${instance ? `live instance ${instance}` : `live ${e.key}`} from "${program}"`);
+      return ws.close(1008, 'extension already connected');
+    }
     e.ext?.close(1000, 'replaced by a newer extension connection');
+    e.program = program;
+    e.title = '';
     entries.set(e.key, e);
     e.ext = ws;
     e.extSeen = Date.now();
@@ -369,7 +377,7 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     const methods = {
       status: () => ({ connected: true, extension: e0 ? e0.ext?.readyState === WebSocket.OPEN : entries.size > 0, browsers: entries.size, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
       // The connected browsers, for list_connected_browsers: name, program path, instance id when the name is shared, in use or not.
-      browsers: () => [...entries.values()].map(b => ({ name: nameOf(b), program: b.program, ...(b.instance && nameOf(b) !== base(b) ? { instance: b.instance } : {}), inUse: b.sessions().length > 0 })),
+      browsers: () => [...entries.values()].map(b => ({ name: nameOf(b), program: b.program, ...(b.instance && nameOf(b) !== base(b) ? { instance: b.instance } : {}), title: b.title ?? '', inUse: b.sessions().length > 0 })),
       // Tabs the user has looked at that no session owns: shown to the agent, never attached without a free session.
       // Only origin and path leave the broker: a query string or fragment often carries tokens.
       unclaimed: async () => {
