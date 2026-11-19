@@ -52,6 +52,10 @@ Reading the connecting program and the system default browser is implemented for
 - `policy.mjs` blocks browser-internal schemes and sensitive domains (banking, payment, identity providers); set `allowedDomains` in `policy.json` for a strict allowlist.
 - Decisions and trade-offs: `docs/adr/` (trust boundary, broker, several browsers on one broker). Vocabulary: `GLOSSARY.md`.
 
+## License
+
+[MIT](LICENSE).
+
 ## Development
 
 - `npm test`: unit tests (`node --test`).
