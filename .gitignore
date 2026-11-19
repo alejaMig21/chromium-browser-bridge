@@ -4,3 +4,4 @@ broker.json
 .codebase-memory/
 *.log
 .atl/
+.claude/worktrees/

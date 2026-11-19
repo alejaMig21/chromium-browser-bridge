@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 Spec: `.scratch/multi-browser/spec.md`. ADR: `docs/adr/0003-several-browsers-on-one-broker.md`.
 
@@ -12,3 +12,7 @@ Spec: `.scratch/multi-browser/spec.md`. ADR: `docs/adr/0003-several-browsers-on-
 - [ ] Control requests (status, unclaimed tabs, reveal, hide, tabs by prefix) are answered for the session's entry
 - [ ] The existing unit tests, the live test (Chrome and the Edge stand-in) and the matrix unit tests pass unchanged, with no edits to their expectations
 - [ ] No new behaviour is visible to a client: same messages, same refusals
+
+## Answer
+
+Done in `bridge.mjs` (commit 345e382): `makeEntry()` holds `ext`, `extSeen`, `pending`, `lastId`, `owners`, `call()`, `sessions()`; one instance for now; each `Session` has `.entry`. Control requests resolve `sessions.get(sid)?.entry ?? entry`. `byTabSession` stays global (ids `bridge-tab-N` are unique). `status.sessions` and `busy()` still count globally. 77/77 tests, no test edited. Ticket 02 must change `onExtension` and `onCdp` to create and look up entries, and add the two-entries-same-tab-id guard test.
