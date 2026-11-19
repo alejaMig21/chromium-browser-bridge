@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test policy.test.mjs launcher.test.mjs platform.test.mjs matrix.test.mjs bridge.test.mjs bridge.sessions.test.mjs broker.test.mjs",
+    "test": "node --test policy.test.mjs launcher.test.mjs platform.test.mjs matrix.test.mjs bridge.test.mjs bridge.sessions.test.mjs bridge.browsers.test.mjs broker.test.mjs",
     "live": "node live-test.mjs"
   },
   "dependencies": {

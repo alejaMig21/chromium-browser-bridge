@@ -6,6 +6,7 @@
 // belongs to at most one session; a session's tabs are released when it disconnects.
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
+import { win32 } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 
 // Fixed by the "key" in extension/manifest.json, so the origin of its socket can be checked.
@@ -13,7 +14,9 @@ export const EXTENSION_ID = 'nbjcgjmkbnkpjjkglddgcmmnknfdeade';
 const SESSION_ID = /^[\w-]{1,64}$/;
 const usable = ts => ts.filter(t => /^https?:|^about:blank$/.test(t.url || ''));
 
-export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}) {
+// identify({ req, remoteAddress, remotePort }) answers which program (a file path) opened an extension connection, or nothing
+// when it cannot tell: that entry is then named "browser". Replaceable so tests inject names and the Windows lookup plugs in.
+export function startBridge({ port = 9340, log = () => {}, captureMs = {}, identify = () => undefined } = {}) {
   const CAP = { real: 8000, nudgeEvery: 500, nudge: 1000, shown: 8000, ...captureMs }; // deadlines of the capture steps (ms)
   const NOT_PAINTED = 'The browser paints nothing for this tab right now: it is in the background, or another window is covering the browser window, or the window is minimized (a browser cannot paint what nobody can see). Read the page with get_page_text or read_page, or ask the user to bring the browser window to the front. BROWSER_REVEAL_TABS=1 lets this tool show the tab for a moment instead, at the price of a flicker.';
   const token = randomBytes(16).toString('hex');
@@ -23,9 +26,10 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
   let nextTabSession = 1;
 
   // Everything the broker keeps about one extension connection (one browser). A tab id is only unique inside one entry,
-  // so tab ownership lives here. There is exactly one entry for now.
-  const makeEntry = () => {
+  // so tab ownership lives here. One entry per connected browser: its program (file path, '' when unknown) and instance id.
+  const makeEntry = (program, instance) => {
     const e = {
+      program, instance, key: instance ?? `legacy:${program}`, // a legacy extension (no id) is identified by its program
       ext: null, extSeen: 0, // the extension pings every 20 s; a live one is never replaced, so a local impostor cannot take its slot
       pending: new Map(), lastId: 0,
       owners: new Map(), // tab id -> { session, until? }  (until: a release in progress)
@@ -41,7 +45,20 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     };
     return e;
   };
-  const entry = makeEntry();
+  const entries = new Map(); // entry key -> entry, the connected browsers in connection order
+  const base = e => (e.program ? win32.basename(e.program, win32.extname(e.program)).toLowerCase() : 'browser');
+  // Two entries with one program name are told apart by the first four characters of their instance id.
+  const nameOf = e => (e.instance && [...entries.values()].filter(o => base(o) === base(e)).length > 1 ? `${base(e)}-${e.instance.slice(0, 4)}` : base(e));
+  const names = () => [...entries.values()].map(nameOf).join(', ');
+  // The entry a client asks for: its exact name, else the one whose name contains the asked one; none or several = nothing.
+  // No choice made: the only connected browser.
+  const resolve = want => {
+    const all = [...entries.values()];
+    if (!want) return all.length === 1 ? all[0] : undefined;
+    const w = want.toLowerCase(), exact = all.filter(e => nameOf(e) === w || base(e) === w);
+    const found = exact.length ? exact : all.filter(e => nameOf(e).includes(w));
+    return found.length === 1 ? found[0] : undefined;
+  };
   const ownedBy = tabId => new Error(`Tab ${tabId} is owned by another Claude session.`);
 
   class Session {
@@ -268,10 +285,12 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     }
   }
 
-  function onExtension(ws) {
-    const e = entry;
+  function onExtension(ws, program, instance) {
+    const fresh = makeEntry(program, instance);
+    const e = entries.get(fresh.key) ?? fresh;
     if (e.ext?.readyState === WebSocket.OPEN && Date.now() - e.extSeen < 45000) return ws.close(1008, 'extension already connected');
     e.ext?.close(1000, 'replaced by a newer extension connection');
+    entries.set(e.key, e);
     e.ext = ws;
     e.extSeen = Date.now();
     for (const s of e.sessions()) s.offered.clear();
@@ -291,14 +310,18 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     ws.on('close', () => {
       if (e.ext !== ws) return; // a replaced socket must not fail the new connection's calls
       e.ext = null;
+      if (entries.get(e.key) === e) entries.delete(e.key);
       for (const s of e.sessions()) s.ws.close(1000, 'extension disconnected');
       for (const p of e.pending.values()) p.reject(new Error('The browser extension disconnected.'));
       e.pending.clear();
     });
   }
 
-  async function onCdp(ws, id) {
-    if (!entry.ext) return ws.close(1000, 'extension not connected');
+  async function onCdp(ws, id, want) {
+    const entry = resolve(want);
+    if (!entries.size) return ws.close(1000, 'extension not connected');
+    // A close reason is at most 123 bytes.
+    if (!entry) return ws.close(1008, (want ? `no connected browser matches "${want}". Connected: ${names()}` : `several browsers are connected, say which one. Connected: ${names()}`).slice(0, 120));
     // A reconnect with the same id (the old socket's close event may not have arrived yet) replaces the old connection.
     const old = sessions.get(id);
     if (old) { old.ws.close(1008, 'replaced by a newer connection with the same session id'); old.release(); }
@@ -331,17 +354,23 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
   // Control channel: the MCP server of a session asks the broker for things that are not CDP (extension status,
   // window restore around a capture). Same auth as /cdp; one JSON request per message.
   const controls = new Set(); // open control sockets: a session that is mid-attach keeps the broker alive
-  function onControl(ws, sid) {
-    const e = sessions.get(sid)?.entry ?? entry; // the session's entry (the only one for now)
+  function onControl(ws, sid, want) {
+    // The browser a request applies to: the one the session is attached to, else the one asked for, else the only one.
+    const e0 = sessions.get(sid)?.entry ?? resolve(want);
+    const noEntry = () => new Error(entries.size ? `Say which browser (several are connected: ${names()}).` : 'The browser extension is not connected.');
+    // Every method that talks to a browser reads the entry through this: with none to pick it fails instead of guessing.
+    const E = () => { if (!e0) throw noEntry(); return e0; };
     controls.add(ws);
     ws.on('close', () => controls.delete(ws));
     ws.on('error', () => {});
     const methods = {
-      status: () => ({ connected: true, extension: e.ext?.readyState === WebSocket.OPEN, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
+      status: () => ({ connected: true, extension: e0 ? e0.ext?.readyState === WebSocket.OPEN : entries.size > 0, browsers: entries.size, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
+      // The connected browsers, for list_connected_browsers: name, program path, instance id when the name is shared, in use or not.
+      browsers: () => [...entries.values()].map(b => ({ name: nameOf(b), program: b.program, ...(b.instance && nameOf(b) !== base(b) ? { instance: b.instance } : {}), inUse: b.sessions().length > 0 })),
       // Tabs the user has looked at that no session owns: shown to the agent, never attached without a free session.
       // Only origin and path leave the broker: a query string or fragment often carries tokens.
       unclaimed: async () => {
-        const ids = new Set();
+        const e = E(), ids = new Set();
         for (const s of e.sessions()) for (const id of s.offered) if (!e.owners.has(id)) ids.add(id);
         if (!ids.size) return [];
         return (await e.call('chrome.tabs.query', [{}])).filter(t => ids.has(t.id)).flatMap(t => {
@@ -352,11 +381,11 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     // For the cross-browser matrix runner: the tabs under one url prefix with their owner (origin and path only; without a
     // prefix nothing, so the whole browser is never listed), and the extension's reveal/hide, the same steps a capture of
     // a background tab uses to show a tab without taking focus.
-    methods.tabs = async prefix => !prefix ? [] : (await e.call('chrome.tabs.query', [{}])).flatMap(t => {
-      try { const u = new URL(t.url); const url = u.origin + u.pathname; return /^https?:$/.test(u.protocol) && url.startsWith(prefix) ? [{ id: t.id, active: !!t.active, windowId: t.windowId, url, owner: e.owners.get(t.id)?.session.id ?? null }] : []; } catch { return []; }
+    methods.tabs = async prefix => !prefix ? [] : (await E().call('chrome.tabs.query', [{}])).flatMap(t => {
+      try { const u = new URL(t.url); const url = u.origin + u.pathname; return /^https?:$/.test(u.protocol) && url.startsWith(prefix) ? [{ id: t.id, active: !!t.active, windowId: t.windowId, url, owner: E().owners.get(t.id)?.session.id ?? null }] : []; } catch { return []; }
     });
-    methods.reveal = tabId => e.call('agent.reveal', [tabId]);
-    methods.hide = shown => e.call('agent.hide', [shown]);
+    methods.reveal = tabId => E().call('agent.reveal', [tabId]);
+    methods.hide = shown => E().call('agent.hide', [shown]);
     ws.on('message', async raw => {
       let req;
       try { req = JSON.parse(raw.toString()); } catch { return; }
@@ -383,7 +412,14 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     const ok = ((path === '/extension' && req.headers.origin === `chrome-extension://${EXTENSION_ID}`)
       || ((path === '/cdp' || path === '/control') && req.headers.origin === undefined && url.searchParams.get('t') === token && SESSION_ID.test(sid)));
     if (!ok) return deny();
-    wss.handleUpgrade(req, socket, head, ws => (path === '/extension' ? onExtension(ws) : path === '/cdp' ? onCdp(ws, sid) : onControl(ws, sid)));
+    const want = url.searchParams.get('b') || undefined; // the browser a client asks for, by name
+    const up = (...a) => wss.handleUpgrade(req, socket, head, ws => (path === '/extension' ? onExtension(ws, ...a) : path === '/cdp' ? onCdp(ws, sid, want) : onControl(ws, sid, want)));
+    if (path !== '/extension') return up();
+    // The extension announces its instance id in the url (?i=); a malformed one is treated as none (a legacy extension).
+    const id = url.searchParams.get('i'), instance = id && SESSION_ID.test(id) ? id : undefined;
+    // Who opened the connection is asked before the handshake completes; a failing lookup means "unknown", never a refusal.
+    Promise.resolve().then(() => identify({ req, remoteAddress: socket.remoteAddress, remotePort: socket.remotePort })).catch(() => undefined)
+      .then(program => up(typeof program === 'string' ? program : '', instance));
   });
   const listening = new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
 
@@ -391,7 +427,7 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}
     listening,
     port,
     cdpEndpoint: (sid = 'default') => `ws://127.0.0.1:${port}/cdp?t=${token}&s=${sid}`,
-    extensionConnected: () => entry.ext?.readyState === WebSocket.OPEN,
+    extensionConnected: () => entries.size > 0,
     sessionCount: () => sessions.size,
     busy: () => sessions.size + controls.size > 0, // a session attached, or one that is talking to us right now
     token,
