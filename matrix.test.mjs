@@ -8,14 +8,20 @@ import { BEHAVIOURS, runMatrix, writeResults } from './matrix.mjs';
 
 const png = (w, h) => { const b = Buffer.alloc(24); b.writeUInt32BE(w, 16); b.writeUInt32BE(h, 20); return b; };
 // A fake browser that behaves like a healthy Chromium: every tool answers the way the real one does.
-function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', 'Chromium', 'Google Chrome'] } = {}) {
-  const used = [];
+// `connected`: the browsers the broker reports; browser_attach picks the one asked for (or lands on `attachesTo` when set).
+function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', 'Chromium', 'Google Chrome'], connected = ['chrome', 'edge', 'brave', 'opera', 'vivaldi'], attachesTo } = {}) {
+  const used = [], attached = [];
   let clicked = 0;
   const call = async (name, args = {}) => {
     used.push(args.action ? `${name}:${args.action}` : name);
     const ok = (text, extra = {}) => ({ err: false, text, images: 0, ...extra });
     switch (name) {
-      case 'browser_attach': return ok('Attached to the user\'s own browser. Tabs in play: 1.');
+      case 'browser_attach': {
+        attached.push(args.browser);
+        if (args.browser && !connected.includes(args.browser)) return { err: true, text: `Browser "${args.browser}" is not connected. Connected: ${connected.join(', ')}.`, images: 0 };
+        return ok(`Browser: ${attachesTo ?? args.browser ?? connected[0]} (${args.browser ? 'requested' : 'only one connected'}). Attached to the user's own browser. Tabs in play: 1.`);
+      }
+      case 'list_connected_browsers': return ok(`Connected browsers (${connected.length}):\n${connected.map(n => `- ${n}: x`).join('\n')}`);
       case 'tabs_create_mcp': return ok(`Created tab 7 at ${args.url}`);
       case 'tabs_close_mcp': return ok('Closed tab 7');
       case 'get_page_text': return ok(`Title: matrix\nURL: x\n---\nMATRIX-PAGE clicked ${clicked}`);
@@ -38,7 +44,7 @@ function fakeBrowser({ minimizedCaptureFails = false, brands = ['Not:A-Brand', '
     }
     return { err: true, text: `unexpected tool ${name}`, images: 0 };
   };
-  return { call, used };
+  return { call, used, attached };
 }
 const allYes = async () => 'y';
 
@@ -76,6 +82,31 @@ test('the run is refused, and filed as a failure, when the attached browser is n
   assert.match(bad.evidence, /Google Chrome/);
   assert.ok(!rows.some(r => r.behaviour === 'read'), 'nothing else ran against the wrong browser');
   assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for'], 'rows measured on the wrong browser are not filed under this name');
+});
+
+test('the run chooses its browser with browser_attach and the failure text no longer tells to close the other browsers', async () => {
+  const f = fakeBrowser();
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'chrome' });
+  assert.deepEqual(f.attached, ['chrome']);
+  assert.equal(rows.find(r => r.behaviour === 'attach').result, 'pass');
+  const bad = (await runMatrix({ call: fakeBrowser().call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'edge' })).find(r => r.behaviour === 'attached browser is the one asked for');
+  assert.doesNotMatch(bad.evidence, /one browser at a time|close the other|disable their extension/i);
+});
+
+test('a browser that is not connected is a refused run with the connected list, and nothing else is filed', async () => {
+  const f = fakeBrowser({ connected: ['chrome', 'edge'] });
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'vivaldi' });
+  assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for']);
+  assert.equal(rows[0].result, 'fail');
+  assert.match(rows[0].evidence, /vivaldi.*not connected.*chrome, edge/);
+  assert.ok(!f.used.includes('tabs_create_mcp'), 'no tab was opened');
+});
+
+test('results are never filed for a browser other than the one attached', async () => {
+  const f = fakeBrowser({ attachesTo: 'edge' });
+  const rows = await runMatrix({ call: f.call, ask: allYes, base: 'http://127.0.0.1:1/', browser: 'chrome' });
+  assert.deepEqual(rows.map(r => r.behaviour), ['attached browser is the one asked for']);
+  assert.match(rows[0].evidence, /asked for chrome.*attached to edge/);
 });
 
 test('the browser asked for is recognised by its brand: Chrome, Edge, Brave, Opera, and Vivaldi (which announces only Chromium)', async () => {

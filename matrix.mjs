@@ -30,19 +30,28 @@ export async function runMatrix({ call, ask, base, drive, browser, installedMajo
   const text = r => r.text ?? '';
   const COVERED = /covering the browser window/; // the bridge's plain message when a covered window paints nothing
 
-  await auto('attach', async () => { const r = await call('browser_attach'); return [!r.err, text(r)]; });
+  let attachedTo; // the connected browser browser_attach says it chose: "Browser: <name> (requested)..."
+  await auto('attach', async () => { const r = await call('browser_attach', browser ? { browser } : {}); attachedTo = /^Browser: (\S+)/.exec(text(r))?.[1]; return [!r.err, text(r)]; });
+  if (browser && rows[0].result === 'fail') { // not connected: refused, with what is connected, and nothing else is filed
+    const listed = text(await call('list_connected_browsers').catch(() => ({})));
+    rows.length = 0;
+    const names = [...listed.matchAll(/^- (\S+?)(?: \(id \S+\))?:/gm)].map(m => m[1]);
+    row('attached browser is the one asked for', 'fail', `asked for ${browser}, but it is not connected. ${names.length ? `Connected: ${names.join(', ')}` : 'No browser is connected'}.`);
+    return rows;
+  }
   let tabId;
   await auto('create tab with URL', async () => { const r = await call('tabs_create_mcp', { url: base }); tabId = /Created tab (\d+)/.exec(text(r))?.[1]; return [!r.err && !!tabId, text(r)]; });
   rows.userAgent = text(await call('javascript_tool', { text: 'navigator.userAgent' }).catch(() => ({})));
-  if (browser) { // several browsers can have the extension, but the broker serves one: never file results under the wrong name
+  if (browser) { // never file results under the wrong name: the attached browser must be the one asked for
     const brands = JSON.parse(text(await call('javascript_tool', { text: 'JSON.stringify((navigator.userAgentData?.brands ?? []).map(b => b.brand))' }).catch(() => ({}))) || '[]');
     // Vivaldi announces itself as "Google Chrome", so for browsers whose product version is their Chromium version the
     // attached browser's Chromium major must also equal the installed program's.
     const uaMajor = Number(/Chrome\/(\d+)/.exec(rows.userAgent)?.[1]);
     const wrongVersion = installedMajor && uaMajor && uaMajor !== installedMajor;
-    if (!isBrowser(browser, brands) || wrongVersion) {
+    const otherName = attachedTo && !attachedTo.toLowerCase().includes(browser.toLowerCase());
+    if (otherName || !isBrowser(browser, brands) || wrongVersion) {
       rows.length = 0; // what was measured so far belongs to another browser
-      row('attached browser is the one asked for', 'fail', `asked for ${browser}, but ${wrongVersion ? `the attached browser runs Chromium ${uaMajor} and the installed ${browser} is ${installedMajor}: it is another browser (Vivaldi announces itself as Google Chrome)` : `the extension that holds the bridge belongs to: ${brands.join(', ')}`}. The broker serves one browser at a time: close the other browsers or disable their extension, then run again`);
+      row('attached browser is the one asked for', 'fail', `asked for ${browser}, but ${otherName ? `it attached to ${attachedTo}` : wrongVersion ? `the attached browser runs Chromium ${uaMajor} and the installed ${browser} is ${installedMajor}: it is another browser (Vivaldi announces itself as Google Chrome)` : `the attached browser announces: ${brands.join(', ')}`}`);
       if (tabId) await call('tabs_close_mcp', { tabId: Number(tabId) }).catch(() => {});
       await call('browser_close').catch(() => {});
       return rows;
