@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkUrl, loadPolicy } from './policy.mjs';
-import { brokerClient } from './broker-client.mjs';
+import { brokerClient, choiceNote } from './broker-client.mjs';
 import { installGuide } from './platform.mjs';
 import { resolveBrowser, launchArgs, startBrowser, findBrowserPid, waitForCdp, waitForPage, cdpUp, isOwned, ownership, killOwned, loadState, saveState, clearState } from './launcher.mjs';
 
@@ -428,20 +428,25 @@ async function start({ browser = 'vivaldi', headless = false, port = 9333 }) {
   return { endpoint, launched: true, name };
 }
 
-reg('browser_attach', "Attach to the browser the user ALREADY has open (their real profile, tabs and logins) through the Local Browser Bridge extension. Needs that extension installed once in their browser; after that there are no prompts and no accounts. Works on one work tab, the tab the user is looking at when you attach; it stays your default when they switch tabs or minimize the browser (tabs_context_mcp marks it; pass tabId to act on another). The browser is never launched, restarted or closed by this tool, and the user's tabs are never navigated away by it. Optional browser (chrome, edge, brave, opera, vivaldi, chromium) tailors the install help if the extension is missing.", { browser: z.string().optional() }, async ({ browser }) => {
+reg('browser_attach', "Attach to the browser the user ALREADY has open (their real profile, tabs and logins) through the Local Browser Bridge extension. Needs that extension installed once in their browser; after that there are no prompts and no accounts. Works on one work tab, the tab the user is looking at when you attach; it stays your default when they switch tabs or minimize the browser (tabs_context_mcp marks it; pass tabId to act on another). The browser is never launched, restarted or closed by this tool, and the user's tabs are never navigated away by it. Optional browser (chrome, edge, brave, opera, vivaldi, chromium) picks which connected browser to attach when several are open (without it: the only connected one, else the system default if connected, else this fails and lists them), and tailors the install help if that browser is not connected. The reply names the browser and how it was chosen.", { browser: z.string().optional() }, async ({ browser }) => {
   const unsupported = browser && /not supported/.test(installGuide(browser, ''));
   if (unsupported) throw new Error(installGuide(browser, '')); // no point waiting for an extension that cannot exist
   // Attaching again must not renumber the tabs or move the work tab: a live attachment is kept as it is.
   if (attachedWs && work && !work.isClosed() && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
-  if (!await broker.waitForExtension(Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000))) throw new Error(`${installGuide(browser, join(here, 'extension'))} If it is installed, make sure the browser is open and this server is running, then call browser_attach again.`);
+  let picked;
+  try { picked = await broker.chooseBrowser({ browser, waitMs: Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000) }); }
+  catch (e) {
+    if (!e.notConnected) throw e;
+    throw new Error(`${e.connected.length ? `${e.message} ` : ''}${installGuide(browser, join(here, 'extension'))} If it is installed, make sure the browser is open and this server is running, then call browser_attach again.`);
+  }
   await disconnect();
   attachedWs = broker.cdpEndpoint();
   let c;
   try { c = await connect(); } catch (e) { attachedWs = null; throw e; }
   const mine = c.pages().filter(p => !p.isClosed());
-  if (!mine.length) return "Attached to the user's own browser, but this session has no tab yet: the tab they are looking at is in use by another Claude session, or it is a browser page (new-tab page, settings) that is never touched. Open your own with tabs_create_mcp. This tool will not close the browser.";
+  if (!mine.length) return `${choiceNote(picked)} Attached to the user's own browser, but this session has no tab yet: the tab they are looking at is in use by another Claude session, or it is a browser page (new-tab page, settings) that is never touched. Open your own with tabs_create_mcp. This tool will not close the browser.`;
   work = await visiblePage(mine);
-  return `Attached to the user's own browser. Tabs in play: ${c.pages().length}. Work tab: the one the user was looking at; it stays the default when they switch tabs. This tool will not close it.`;
+  return `${choiceNote(picked)} Attached to the user's own browser. Tabs in play: ${c.pages().length}. Work tab: the one the user was looking at; it stays the default when they switch tabs. This tool will not close it.`;
 });
 reg('browser_launch', 'Start a browser with a dedicated profile and a local debug port, then connect to it. If one already answers on that port, just attach. headless=true opens no window. For a browser the user already has open, use browser_attach instead.', { browser: z.string().optional().describe('vivaldi (default), chrome, edge, brave, or a path to a Chromium exe'), headless: z.boolean().optional(), port: z.number().optional() }, async args => {
   attachedWs = null;

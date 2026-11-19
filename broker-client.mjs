@@ -28,8 +28,12 @@ export function spawnBroker({ dir, port = 9340 }) {
   spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], { stdio: 'ignore', windowsHide: true }).unref();
 }
 
-export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log = () => {} }) {
-  let info = null, ctl = null;
+// The reply line that says which browser was attached and why.
+export const choiceNote = ({ name, how }) => `Browser: ${name} (${{ requested: 'requested', only: 'the only one connected', default: 'the system default browser' }[how]}).`;
+
+// defaultBrowser() answers the system default browser's program name (e.g. "chrome") or nothing; absent = skipped.
+export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log = () => {}, defaultBrowser }) {
+  let info = null, ctl = null, chosen = null;
   const waiting = new Map();
   let n = 0;
 
@@ -80,14 +84,32 @@ export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log =
     ensure,
     // The broker may have just started, so the extension gets a bounded time to reconnect to it; one that has been up
     // longer and still has no extension means the extension is really not there.
-    async waitForExtension(ms) {
-      for (let end = Date.now() + ms; ; await sleep(500)) {
-        const st = await rpc('status');
-        if (st.extension) return true;
-        if (st.uptimeMs > EXTENSION_GRACE_MS || Date.now() >= end) return false;
+    // Picks the connected browser this session attaches to: the one asked for, else the only one, else the system default
+    // when it is connected. Resolves { name, how } (how: requested | only | default) and remembers it for cdpEndpoint().
+    // Fails at once when the choice cannot be made from what is connected (several, no usable default); a requested browser
+    // that is missing, or none at all, is waited for while the broker is younger than graceMs, at most waitMs.
+    async chooseBrowser({ browser, waitMs = 35000, graceMs = EXTENSION_GRACE_MS } = {}) {
+      for (let end = Date.now() + waitMs; ; await sleep(500)) {
+        const [st, list] = [await rpc('status'), await rpc('browsers')];
+        const names = list.map(b => b.name), shown = names.join(', ');
+        const hit = want => { const w = want.toLowerCase(), exact = names.filter(n => n === w); return exact.length ? exact : names.filter(n => n.includes(w)); };
+        if (browser) {
+          const found = hit(browser);
+          if (found.length > 1) throw new Error(`"${browser}" matches several connected browsers (${found.join(', ')}); name one of them.`);
+          if (found.length) return (chosen = found[0], { name: chosen, how: 'requested' });
+        } else if (names.length === 1) return (chosen = names[0], { name: chosen, how: 'only' });
+        else if (names.length) {
+          const d = await Promise.resolve().then(() => defaultBrowser?.()).catch(() => undefined); // a failing lookup = unknown
+          const found = d ? hit(String(d)) : [];
+          if (found.length === 1) return (chosen = found[0], { name: chosen, how: 'default' });
+          throw new Error(`Several browsers are connected and none is the system default; say which one with the browser argument. Connected: ${shown}.`);
+        }
+        if (st.uptimeMs > graceMs || Date.now() >= end) {
+          throw Object.assign(new Error(names.length ? `Browser "${browser}" is not connected. Connected: ${shown}.` : 'No browser is connected.'), { notConnected: true, connected: names });
+        }
       }
     },
-    cdpEndpoint: () => `ws://127.0.0.1:${info.port}/cdp?t=${info.token}&s=${sessionId}`,
+    cdpEndpoint: () => `ws://127.0.0.1:${info.port}/cdp?t=${info.token}&s=${sessionId}${chosen ? `&b=${encodeURIComponent(chosen)}` : ''}`,
     // Reading state never starts a broker: with none running these report that, instead of resurrecting one.
     status: () => rpc('status', [], { start: false }).catch(() => ({ connected: false })),
     unclaimed: () => rpc('unclaimed', [], { start: false }).catch(() => []),
