@@ -6,9 +6,8 @@
 // belongs to at most one session; a session's tabs are released when it disconnects.
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { win32 } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { programOfConnection, matchBrowsers } from './platform.mjs';
+import { programOfConnection, matchBrowsers, programName } from './platform.mjs';
 
 // Fixed by the "key" in extension/manifest.json, so the origin of its socket can be checked.
 export const EXTENSION_ID = 'nbjcgjmkbnkpjjkglddgcmmnknfdeade';
@@ -48,7 +47,7 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     return entry;
   };
   const entries = new Map(); // entry key -> entry, the connected browsers in connection order
-  const base = entry => (entry.program ? win32.basename(entry.program, win32.extname(entry.program)).toLowerCase() : 'browser');
+  const base = entry => (entry.program ? programName(entry.program) : 'browser');
   // Two entries with one program name are told apart by the first four characters of their instance id.
   const nameOf = entry => (entry.instance && [...entries.values()].filter(o => base(o) === base(entry)).length > 1 ? `${base(entry)}-${entry.instance.slice(0, 4)}` : base(entry));
   const names = () => [...entries.values()].map(nameOf).join(', ');

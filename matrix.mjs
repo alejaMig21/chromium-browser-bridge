@@ -96,8 +96,8 @@ export async function runMatrix({ call, ask, base, drive, browser, installedMajo
     let minimized = false;
     await step('screenshot while minimized', async () => { const m = await drive.minimize(); minimized = m.ok; return m; }, minimizedShot);
     if (minimized) await drive.restore();
-    await step('tab switch keeps work tab', () => drive.switchTabs(base, attachedTo), async a => { const [ok, ev] = await workTabRead(); return [ok, `${a.note ?? 'tabs switched'}; ${ev}`]; });
-    await step('two sessions', () => drive.secondSession(base, attachedTo), async a => { const [ok, ev] = await workTabRead(); return [a.ok && ok, `${a.evidence}; first session: ${ev}`]; });
+    await step('tab switch keeps work tab', () => drive.switchTabs(attachedTo), async a => { const [ok, ev] = await workTabRead(); return [ok, `${a.note ?? 'tabs switched'}; ${ev}`]; });
+    await step('two sessions', () => drive.secondSession(attachedTo), async a => { const [ok, ev] = await workTabRead(); return [a.ok && ok, `${a.evidence}; first session: ${ev}`]; });
     await step('broker survives the starter closing', () => drive.closeSecond(), async a => { const r = await call('get_page_text'); return [a.ok && !r.err, `${a.evidence}; first session: ${text(r)}`]; });
   } else {
     await manual('screenshot while minimized', 'Minimize the browser window now, then press Enter (type skip to skip).', minimizedShot);
@@ -153,7 +153,7 @@ export async function makeDrive({ browser, connect, base, makeBroker }) {
       return { ok: true };
     },
     async restore() { if (minimized) { await ps('restore', behind); minimized = false; await sleep(400); } },
-    async switchTabs(_base, attachedTo) {
+    async switchTabs(attachedTo) {
       const [tab] = await broker(attachedTo).tabs(base.replace(/\/$/, '')); // only the matrix's own tab is asked for
       if (!tab) return { ok: false, skip: true, note: 'the matrix tab was not found among the browser tabs' };
       const shown = await broker(attachedTo).reveal(tab.id); // the browser activates the matrix tab, as if the user had switched to it
@@ -161,7 +161,7 @@ export async function makeDrive({ browser, connect, base, makeBroker }) {
       await broker(attachedTo).hide(shown); // and back to the tab the user was on
       return { ok: true, note: `browser tab ${tab.id} was activated and the user's tab put back (through the extension's reveal/hide, so the bridge is not told it was the user)` };
     },
-    async secondSession(_base, attachedTo) {
+    async secondSession(attachedTo) {
       second = await connect();
       const att = await second.call('browser_attach', attachedTo ?? browser ? { browser: attachedTo ?? browser } : {});
       const created = await second.call('tabs_create_mcp', { url: `${base}?second` });

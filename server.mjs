@@ -464,9 +464,9 @@ reg('browser_launch', 'Start a browser with a dedicated profile and a local debu
   return `${r.launched ? `Launched ${r.name}${args.headless ? ' (headless)' : ''}` : 'Attached to the browser already running'} on ${cdp}. Tabs: ${c.pages().length}.`;
 });
 reg('browser_status', 'Report whether a browser answers on the debug port, whether this server is connected, and whether this tool launched it.', {}, async () => {
-  const v = await cdpUp(cdp), s = loadState(cdpPort());
-  if (attachedWs) return JSON.stringify({ mode: 'attached to the user\'s own browser', connected: !!ctx && !!curBrowser?.isConnected(), tabs: ctx?.pages().length ?? 0, debuggerAttached: !!ctx && ctx.pages().length > 0, launchedByThisTool: false, idleCloseSeconds: IDLE_MS / 1000, broker: await broker.status(), connectedBrowsers: describeBrowsers(await broker.browsers()) }, null, 2);
-  return JSON.stringify({ endpoint: cdp, reachable: !!v, browser: v?.Browser ?? null, connected: !!ctx, tabs: ctx?.pages().length ?? 0, launchedByThisTool: !!s && await isOwned(s, here), idleCloseSeconds: IDLE_MS / 1000, connectedBrowsers: describeBrowsers(await broker.browsers()) }, null, 2);
+  const v = await cdpUp(cdp), s = loadState(cdpPort()), connectedBrowsers = describeBrowsers(await broker.browsers());
+  if (attachedWs) return JSON.stringify({ mode: 'attached to the user\'s own browser', connected: !!ctx && !!curBrowser?.isConnected(), tabs: ctx?.pages().length ?? 0, debuggerAttached: !!ctx && ctx.pages().length > 0, launchedByThisTool: false, idleCloseSeconds: IDLE_MS / 1000, broker: await broker.status(), connectedBrowsers }, null, 2);
+  return JSON.stringify({ endpoint: cdp, reachable: !!v, browser: v?.Browser ?? null, connected: !!ctx, tabs: ctx?.pages().length ?? 0, launchedByThisTool: !!s && await isOwned(s, here), idleCloseSeconds: IDLE_MS / 1000, connectedBrowsers }, null, 2);
 });
 reg('list_connected_browsers', 'List the browsers connected through the Local Browser Bridge extension: name, program path, instance id when several share a name, active tab title, and whether a session is using it. Read-only: opens no tab and attaches nothing, so it works before browser_attach. Use it to see what browser_attach can pick from.', {}, async () => describeBrowsers(await broker.browsers()));
 // Playwright hides the close reason the broker gives when this session's browser goes away, so say it from the broker's own list:

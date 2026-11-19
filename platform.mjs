@@ -135,10 +135,11 @@ export function regValue(text, name) {
 }
 
 // The program name (executable file name, no extension, lower case) at the start of a shell open command, or nothing.
+export const programName = file => path.win32.basename(file, path.win32.extname(file)).toLowerCase();
 export function programFromCommand(command) {
   const m = /^\s*(?:"([^"]+)"|(\S+))/.exec(String(command ?? ''));
   const exe = m && (m[1] ?? m[2]);
-  return exe ? path.win32.basename(exe, path.win32.extname(exe)).toLowerCase() || undefined : undefined;
+  return exe ? programName(exe) || undefined : undefined;
 }
 
 // The program that opens http links on this Windows user account (UserChoice ProgId, then that ProgId's open command),
