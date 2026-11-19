@@ -107,6 +107,35 @@ export function ownerPid(text, clientPort, serverPort) {
 const runCommand = (file, args) => new Promise((resolve, reject) =>
   execFile(file, args, { windowsHide: true, timeout: 2000 }, (err, out) => (err ? reject(err) : resolve(String(out)))));
 
+// The data of one named value in `reg query` text ("    Name    REG_SZ    data"), or nothing.
+export function regValue(text, name) {
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const m = /^\s+(.+?)\s+REG_\w+\s+(.*?)\s*$/.exec(line);
+    if (m && m[1].toLowerCase() === name.toLowerCase()) return m[2];
+  }
+}
+
+// The program name (executable file name, no extension, lower case) at the start of a shell open command, or nothing.
+export function programFromCommand(command) {
+  const m = /^\s*(?:"([^"]+)"|(\S+))/.exec(String(command ?? ''));
+  const exe = m && (m[1] ?? m[2]);
+  return exe ? path.win32.basename(exe, path.win32.extname(exe)).toLowerCase() || undefined : undefined;
+}
+
+// The program that opens http links on this Windows user account (UserChoice ProgId, then that ProgId's open command),
+// named like the broker names browsers. Anything else (no key, failure, slow answer, other systems) is nothing.
+export async function defaultBrowserProgram({ run = runCommand, timeoutMs = 2000, platform = process.platform } = {}) {
+  if (platform !== 'win32') return undefined;
+  let timer;
+  const lookup = (async () => {
+    const progId = regValue(await run('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice', '/v', 'ProgId']), 'ProgId');
+    if (!progId) return undefined;
+    return programFromCommand(regValue(await run('reg', ['query', `HKCR\\${progId}\\shell\\open\\command`, '/ve']), '(Default)'));
+  })().catch(() => undefined);
+  const bound = new Promise(r => { timer = setTimeout(r, timeoutMs, undefined); });
+  try { return await Promise.race([lookup, bound]); } finally { clearTimeout(timer); }
+}
+
 // Which program opened a connection to the bridge: its executable's full path, or nothing. Windows only (netstat for the
 // owning pid, one PowerShell call for the path, about half a second). Any failure, or no answer within timeoutMs, is nothing.
 export async function programOfConnection({ req, remoteAddress, remotePort }, { run = runCommand, timeoutMs = 2000, platform = process.platform } = {}) {

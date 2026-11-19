@@ -98,3 +98,44 @@ test('stopping a process tree: taskkill on Windows, the process group then the p
   await killTree(8, { platform: 'darwin', run: () => {}, kill: (pid, sig) => { second.push(pid); if (pid < 0) throw new Error('ESRCH'); } });
   assert.deepEqual(second, [-8, 8], 'falls back to the pid when it leads no process group');
 });
+
+// ---- system default browser (Windows) ----
+import { regValue, programFromCommand, defaultBrowserProgram } from './platform.mjs';
+
+const USER_CHOICE = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice\r\n    Hash    REG_SZ    abc/DEF=\r\n    ProgId    REG_SZ    VivaldiHTM.QWERTY123\r\n\r\n';
+const OPEN_CMD = 'HKEY_CLASSES_ROOT\\VivaldiHTM.QWERTY123\\shell\\open\\command\r\n    (Default)    REG_SZ    "C:\\Users\\me\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe" -- "%1"\r\n\r\n';
+
+test('regValue reads one named value from reg query text', () => {
+  assert.equal(regValue(USER_CHOICE, 'ProgId'), 'VivaldiHTM.QWERTY123');
+  assert.equal(regValue(OPEN_CMD, '(Default)'), '"C:\\Users\\me\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe" -- "%1"');
+  assert.equal(regValue('ERROR: The system was unable to find the specified registry key or value.', 'ProgId'), undefined);
+});
+
+test('programFromCommand gives the lower-case executable name without extension', () => {
+  assert.equal(programFromCommand('"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --single-argument %1'), 'chrome');
+  assert.equal(programFromCommand('C:\\Windows\\msedge.EXE -url %1'), 'msedge');
+  assert.equal(programFromCommand('"C:\\Users\\me\\Vivaldi\\vivaldi.exe" -- "%1"'), 'vivaldi');
+  assert.equal(programFromCommand(''), undefined);
+  assert.equal(programFromCommand(undefined), undefined);
+});
+
+test('defaultBrowserProgram follows UserChoice then the ProgId open command', async () => {
+  const calls = [];
+  const run = async (file, args) => { calls.push(args.join(' ')); return /UserChoice/.test(args.join(' ')) ? USER_CHOICE : OPEN_CMD; };
+  assert.equal(await defaultBrowserProgram({ run, platform: 'win32' }), 'vivaldi');
+  assert.match(calls[1], /VivaldiHTM\.QWERTY123\\shell\\open\\command/);
+});
+
+test('defaultBrowserProgram returns nothing off Windows, on a missing key, a failure or a timeout', async () => {
+  const never = async () => { throw new Error('must not run'); };
+  assert.equal(await defaultBrowserProgram({ run: never, platform: 'linux' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: async () => { throw new Error('key not found'); }, platform: 'win32' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: async () => 'garbage', platform: 'win32' }), undefined);
+  assert.equal(await defaultBrowserProgram({ run: () => new Promise(() => {}), platform: 'win32', timeoutMs: 50 }), undefined);
+});
+
+test('defaultBrowserProgram reads a real answer on this Windows machine', { skip: process.platform !== 'win32' }, async () => {
+  const p = await defaultBrowserProgram();
+  console.log('real default browser program:', p);
+  assert.ok(typeof p === 'string' && p.length > 0 && p === p.toLowerCase() && !/\.exe$/.test(p));
+});
