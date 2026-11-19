@@ -164,7 +164,7 @@ test('one browser going away closes only its own sessions', async () => {
   const a = await browser(edge), b = await browser(chrome);
   const sa = await session('gone-a', 'edge'), sb = await session('gone-b', 'chrome');
   a.ws.close();
-  assert.equal(await sa.closed, 'extension disconnected');
+  assert.equal(await sa.closed, 'msedge disconnected. Still connected: chrome');
   await sleep(100);
   assert.equal((await autoAttach(sb)).error, undefined, 'the other browser still works');
   sb.close(); b.ws.close();
