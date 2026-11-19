@@ -42,7 +42,9 @@ for (const e of readdirSync(liveRoot)) {
 const tmp = mkdtempSync(join(liveRoot, 'run-'));
 process.on('exit', () => killRun(tmp)); // however this process ends, the run's browsers and broker go with it
 const brokerDir = join(tmp, 'broker'); // the broker the servers start lives (and is stopped) under this run's folder
-const serverEnv = { ...process.env, BROWSER_OUTPUT: tmp, CDP_ENDPOINT: `http://127.0.0.1:${PORT}`, BROWSER_BRIDGE_PORT: String(BRIDGE_PORT), BROKER_DIR: brokerDir, BROKER_IDLE_MS: '600000', BROWSER_EXT_WAIT_MS: '0' };
+const sysTemp = join(tmp, 'sys-temp'); // the servers' own temp dir (Playwright's playwright-artifacts-*): killed servers cannot clean it, the run folder removal does
+mkdirSync(sysTemp);
+const serverEnv = { ...process.env, TEMP: sysTemp, TMP: sysTemp, BROWSER_OUTPUT: tmp, CDP_ENDPOINT: `http://127.0.0.1:${PORT}`, BROWSER_BRIDGE_PORT: String(BRIDGE_PORT), BROKER_DIR: brokerDir, BROKER_IDLE_MS: '600000', BROWSER_EXT_WAIT_MS: '0' };
 
 const client = new Client({ name: 'live-test', version: '1' });
 const transport = new StdioClientTransport({ command: process.execPath, args: [join(dirname(fileURLToPath(import.meta.url)), 'server.mjs')], env: { ...serverEnv, CLAUDE_BROWSER_TMP: join(tmp, 'server-tmp'), BROWSER_IDLE_MS: '8000', BRIDGE_TRACE: '1' }, stderr: 'pipe' });
@@ -441,6 +443,55 @@ try {
     ok('04 attach starts a new broker and recovers', !again2.err && (await call('get_page_text')).text.includes('Hello'), again2.text);
   }
   await call('browser_close');
+  // ---- ticket 10: two stand-in Edge profiles, both running the current extension (instance id and tab title for real) ----
+  {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const killFolder = folder => { try { execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${folder.replaceAll('\\', '*')}*' -and $_.CommandLine -notlike '*--type=*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }`], { stdio: 'ignore' }); } catch { /* none left */ } };
+    const startSession = async n => { const c = new Client({ name: `live-test-mb-${n}`, version: '1' }); const t = new StdioClientTransport({ command: process.execPath, args: [join(here, 'server.mjs')], env: { ...serverEnv, CLAUDE_BROWSER_TMP: join(tmp, `server-tmp-mb-${n}`), BROWSER_IDLE_MS: '0' }, stderr: 'pipe' }); t.stderr.on('data', () => {}); extraClients.push(c); await c.connect(t); return callOn(c); };
+    const poll = async (fn, okFn, tries = 40) => { let r; for (let i = 0; i < tries; i++) { r = await fn(); if (okFn(r)) break; await new Promise(x => setTimeout(x, 500)); } return r; };
+    const nameOf = (text, title) => new RegExp(`^- ([\\w.-]+?)(?: \\(id [\\w-]+\\))?:[^\\n]*active tab: "${title}"`, 'm').exec(text)?.[1];
+    // Stand-in A is the one above (user-browser, port 9302, showing "Test Page"). Stand-in B: another profile, showing "Second".
+    spawn(live.exe, [`--user-data-dir=${join(tmp, 'second-profile')}`, `--load-extension=${extDir}`, '--disable-features=DisableLoadExtensionCommandLineSwitch', '--headless=new', '--remote-debugging-port=9303', '--no-first-run', `${base}second`], { stdio: 'ignore', detached: true, env: { ...process.env, TEMP: tmp, TMP: tmp } }).unref();
+    const listed = await poll(() => call('list_connected_browsers'), r => /Connected browsers \(2\)/.test(r.text) && /active tab: "Second"/.test(r.text) && /active tab: "Test Page"/.test(r.text));
+    ok('10 two stand-in profiles are listed as two connected browsers', !listed.err && /Connected browsers \(2\)/.test(listed.text), listed.text);
+    const nameA = nameOf(listed.text, 'Test Page'), nameB = nameOf(listed.text, 'Second');
+    ok('10 both names are suffixed and distinct, each with its own tab title', /^msedge-\w{4}$/.test(nameA ?? '') && /^msedge-\w{4}$/.test(nameB ?? '') && nameA !== nameB, listed.text);
+    ok('10 the list says the instance ids that tell the two apart', (listed.text.match(/\(id [\w-]+\)/g) ?? []).length === 2, listed.text);
+
+    const s2 = await startSession(2);
+    const noChoice = await s2('browser_attach');
+    ok('10 browser_attach with no argument and two browsers fails and lists them', noChoice.err && noChoice.text.includes(nameA) && noChoice.text.includes(nameB), noChoice.text);
+    const onB = await s2('browser_attach', { browser: nameB });
+    ok('10 browser_attach with browser attaches to the one asked for', !onB.err && new RegExp(`Browser: ${nameB} \\(requested\\)`).test(onB.text), onB.text);
+    const onA = await call('browser_attach', { browser: nameA });
+    ok('10 a second session attaches to the other browser at the same time', !onA.err && new RegExp(`Browser: ${nameA} \\(requested\\)`).test(onA.text), onA.text);
+    const tabB = await s2('tabs_create_mcp', { url: `${base}second` });
+    ok('10 the session on B opens its own tab in B', /Created tab \d+/.test(tabB.text), tabB.text);
+    const [readA, readB] = await Promise.all([call('get_page_text'), s2('get_page_text')]);
+    ok('10 both sessions read their own browser at the same time', readA.text.includes('Hello') && readB.text.includes('second page'), `${readA.text} | ${readB.text}`);
+    const [shotAB, shotBB] = await Promise.all([call('computer', { action: 'screenshot' }), s2('computer', { action: 'screenshot' })]);
+    ok('10 both sessions capture at the same time', shotAB.images === 1 && shotBB.images === 1, `${shotAB.text} | ${shotBB.text}`);
+    ok('10 the session on A does not see the tab of the session on B', !(await call('tabs_context_mcp')).text.includes('/second'));
+
+    // Story 11: the first session switches to the other browser; what it held in A is released.
+    const switched = await call('browser_attach', { browser: nameB });
+    ok('10 browser_attach with another browser switches the session', !switched.err && new RegExp(`Browser: ${nameB} \\(requested\\)`).test(switched.text) && !/Already attached/.test(switched.text), switched.text);
+    const s3 = await startSession(3);
+    const takeA = await s3('browser_attach', { browser: nameA });
+    const ctxA = await poll(() => s3('tabs_context_mcp'), r => /Tab ID: \d+/.test(r.text) && !r.err);
+    ok('10 after the switch, the tab it held in A belongs to nobody (a new session on A gets it)', !takeA.err && /Tab ID: \d+ \|[^\n]*Test Page|Tab ID: \d+[^\n]*127\.0\.0\.1/.test(ctxA.text), `${takeA.text} | ${ctxA.text}`);
+    ok('10 the switched session now works in B', (await call('get_page_text')).text.length > 0 && !(await call('tabs_context_mcp')).err);
+
+    // Closing A: its session is told what was lost and what is left; the sessions on B keep working.
+    killFolder(join(tmp, 'user-browser'));
+    const lost = await poll(() => s3('tabs_context_mcp'), r => r.err);
+    ok('10 closing a browser tells its session which one went and which are still connected', lost.err && new RegExp(`${nameA} disconnected\\. Still connected: ${nameB.split('-')[0]}\\.`).test(lost.text), lost.text);
+    ok('10 the sessions on the other browser keep working', (await s2('get_page_text')).text.includes('second page') && !(await call('tabs_context_mcp')).err);
+    const left = await poll(() => call('list_connected_browsers'), r => /Connected browsers \(1\)/.test(r.text));
+    ok('10 the list shows only the browser that is left', /Connected browsers \(1\)/.test(left.text) && left.text.includes(nameB.split('-')[0]) && !left.text.includes(nameA), left.text);
+    await s3('browser_close'); await s2('browser_close'); await call('browser_close');
+    killFolder(join(tmp, 'second-profile'));
+  }
   try { execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '${userPat}' -and $_.CommandLine -notlike '*--type=*' } | ForEach-Object { taskkill /PID $_.ProcessId /T /F }`], { stdio: 'ignore' }); } catch { /* cleaned in finally too */ }
   }
 

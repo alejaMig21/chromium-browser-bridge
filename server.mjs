@@ -86,6 +86,8 @@ async function doTrack(page) {
 }
 
 async function connect() {
+  // A browser that is gone gets its answer from the broker's list: Playwright waits out its whole timeout on a socket the broker closes at once.
+  if (attachedWs) { const gone = await lostBrowserNote(); if (gone) throw new Error(`${gone} Call browser_attach again.`); }
   // The user's own browser may ask them to approve the connection, so give them a minute to answer.
   const browser = await chromium.connectOverCDP(attachedWs ?? cdp, { timeout: attachedWs ? 60000 : 10000 }).catch(e => {
     throw new Error(attachedWs
@@ -238,7 +240,8 @@ function reg(name, description, shape, fn) {
     } catch (e) {
       // The broker (and with it the browser connection) can die under a running call: say what to do.
       const lost = attachedWs && /Target (page, context or browser )?(has been )?closed|Connection closed|browser has been closed/i.test(String(e.message));
-      return { isError: true, content: [{ type: 'text', text: String(e.message ?? e) + (lost ? ' The connection to the browser broker was lost; call browser_attach again.' : '') }] };
+      const gone = lost ? await lostBrowserNote() : '';
+      return { isError: true, content: [{ type: 'text', text: String(e.message ?? e) + (gone ? ` ${gone} Call browser_attach again.` : lost ? ' The connection to the browser broker was lost; call browser_attach again.' : '') }] };
     }
     finally { inflight--; touch(); }
   });
@@ -465,6 +468,13 @@ reg('browser_status', 'Report whether a browser answers on the debug port, wheth
   return JSON.stringify({ endpoint: cdp, reachable: !!v, browser: v?.Browser ?? null, connected: !!ctx, tabs: ctx?.pages().length ?? 0, launchedByThisTool: !!s && await isOwned(s, here), idleCloseSeconds: IDLE_MS / 1000, connectedBrowsers: describeBrowsers(await broker.browsers()) }, null, 2);
 });
 reg('list_connected_browsers', 'List the browsers connected through the Local Browser Bridge extension: name, program path, instance id when several share a name, active tab title, and whether a session is using it. Read-only: opens no tab and attaches nothing, so it works before browser_attach. Use it to see what browser_attach can pick from.', {}, async () => describeBrowsers(await broker.browsers()));
+// Playwright hides the close reason the broker gives when this session's browser goes away, so say it from the broker's own list:
+// empty unless the connection really dropped, the broker is still up and no longer lists the browser this session was attached to.
+async function lostBrowserNote() {
+  if (!attachedName || curBrowser?.isConnected()) return '';
+  const alive = (await broker.status()).uptimeMs !== undefined, names = (await broker.browsers()).map(b => b.name);
+  return alive && !names.includes(attachedName) ? `${attachedName} disconnected. Still connected: ${names.join(', ') || 'none'}.` : '';
+}
 // A live round-trip, because a wedged Playwright connection still reports itself as connected.
 async function healthy() {
   if (!ctx || !curBrowser?.isConnected() || !(attachedWs || await cdpUp(cdp))) return false;
