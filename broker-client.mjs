@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import { commandLineOf } from './launcher.mjs';
-import { discoveryDir } from './platform.mjs';
+import { discoveryDir, matchBrowsers } from './platform.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -37,13 +37,15 @@ export const describeBrowsers = list => list.length
   : 'No browser is connected. Install the Local Browser Bridge extension in the browser the user has open, then call browser_attach.';
 
 // defaultBrowser() answers the system default browser's program name (e.g. "chrome") or nothing; absent = skipped.
-export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log = () => {}, defaultBrowser }) {
+// browser: the connected browser the control requests apply to when this client is not attached to one itself (several connected).
+export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log = () => {}, defaultBrowser, browser: controlBrowser }) {
   let info = null, ctl = null, chosen = null;
   const waiting = new Map();
   let n = 0;
 
   const open = i => new Promise(resolve => {
-    const ws = new WebSocket(`ws://127.0.0.1:${i.port}/control?t=${i.token}&s=${sessionId}`, { handshakeTimeout: 3000 });
+    const want = controlBrowser ?? chosen;
+    const ws = new WebSocket(`ws://127.0.0.1:${i.port}/control?t=${i.token}&s=${sessionId}${want ? `&b=${encodeURIComponent(want)}` : ''}`, { handshakeTimeout: 3000 });
     ws.once('open', () => resolve(ws));
     ws.once('error', () => resolve(null));
     ws.once('unexpected-response', () => resolve(null));
@@ -97,7 +99,7 @@ export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log =
       for (let end = Date.now() + waitMs; ; await sleep(500)) {
         const [st, list] = [await rpc('status'), await rpc('browsers')];
         const names = list.map(b => b.name), shown = names.join(', ');
-        const hit = want => { const w = want.toLowerCase(), exact = names.filter(n => n === w); return exact.length ? exact : names.filter(n => n.includes(w)); };
+        const hit = (want, opts) => matchBrowsers(want, list, opts).map(b => b.name);
         if (browser) {
           const found = hit(browser);
           if (found.length > 1) throw new Error(`"${browser}" matches several connected browsers (${found.join(', ')}); name one of them.`);
@@ -105,7 +107,7 @@ export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log =
         } else if (names.length === 1) return (chosen = names[0], { name: chosen, how: 'only' });
         else if (names.length) {
           const d = await Promise.resolve().then(() => defaultBrowser?.()).catch(() => undefined); // a failing lookup = unknown
-          const found = d ? hit(String(d)) : [];
+          const found = d ? hit(String(d), { exactOnly: true }) : []; // the default is never guessed from a name that merely contains it
           if (found.length === 1) return (chosen = found[0], { name: chosen, how: 'default' });
           throw new Error(`Several browsers are connected and none is the system default; say which one with the browser argument. Connected: ${shown}.`);
         }

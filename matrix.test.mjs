@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BEHAVIOURS, runMatrix, writeResults } from './matrix.mjs';
+import { BEHAVIOURS, runMatrix, writeResults, makeDrive } from './matrix.mjs';
 
 const png = (w, h) => { const b = Buffer.alloc(24); b.writeUInt32BE(w, 16); b.writeUInt32BE(h, 20); return b; };
 // A fake browser that behaves like a healthy Chromium: every tool answers the way the real one does.
@@ -151,6 +151,26 @@ test('with a drive, nothing is asked and every row is run by the runner, minimiz
   assert.deepEqual(asked, []);
   assert.deepEqual(d.log, ['minimize', 'restore', 'switch', 'second', 'closeSecond']);
   assert.deepEqual(rows.filter(r => r.result !== 'pass').map(r => `${r.behaviour}: ${r.result} ${r.evidence}`), []);
+});
+
+test('with a drive, the steps that reach the browser are told which connected browser the attach chose', async () => {
+  const seen = [];
+  const d = fakeDrive({ switchTabs: async (base, name) => { seen.push(['switch', name]); return { ok: true }; }, secondSession: async (base, name) => { seen.push(['second', name]); return { ok: true, evidence: 'ok' }; } });
+  await runMatrix({ call: fakeBrowser({ attachesTo: 'chrome-3f9a' }).call, ask: async () => 'y', base: 'http://127.0.0.1:1/', drive: d });
+  assert.deepEqual(seen, [['switch', 'chrome-3f9a'], ['second', 'chrome-3f9a']]);
+});
+
+// The real drive's way to the broker, with the broker client and the second MCP session replaced.
+test('the real drive sends the browser to its control channel and to the second session\'s attach', async () => {
+  const made = [], calls = [];
+  const makeBroker = opts => { made.push(opts); return { tabs: async () => [{ id: 3 }], reveal: async () => ({}), hide: async () => {}, status: async () => ({ sessions: 2, connected: true }) }; };
+  const second = { call: async (name, args) => { calls.push([name, args]); return { err: false, text: name === 'tabs_create_mcp' ? 'Created tab 9' : 'MATRIX-PAGE' }; }, client: { close: async () => {} } };
+  const d = await makeDrive({ browser: 'chrome', connect: async () => second, base: 'http://127.0.0.1:1/', makeBroker });
+  assert.equal((await d.switchTabs('http://127.0.0.1:1/', 'chrome-3f9a')).ok, true);
+  assert.deepEqual(made.map(o => [o.sessionId, o.browser]), [['matrix-drive', 'chrome-3f9a']]);
+  assert.equal((await d.secondSession('http://127.0.0.1:1/', 'chrome-3f9a')).ok, true);
+  assert.deepEqual(calls[0], ['browser_attach', { browser: 'chrome-3f9a' }]);
+  assert.equal(made.length, 1, 'one control client for the whole run');
 });
 
 test('with a drive, a window that cannot be minimized skips that row with the reason and still restores nothing', async () => {

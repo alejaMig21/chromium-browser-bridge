@@ -79,6 +79,23 @@ test('several connected, no name: the system default when it is connected', asyn
   chrome.close(); edge.close(); await sleep(150);
 });
 
+test('the system default is matched by exact program name only: chromehelper is never the default "chrome"', async () => {
+  const [helper, edge] = [await browser('chromehelper'), await browser('msedge')];
+  await assert.rejects(client('impostor', () => 'chrome').chooseBrowser({ ...fast }), e => /chromehelper, msedge/.test(e.message) && /which one/.test(e.message));
+  helper.close(); edge.close(); await sleep(150);
+});
+
+test('the control channel carries the chosen browser, so tabs, reveal and hide work with several browsers connected', async () => {
+  const [chrome, edge] = [await browser('chrome'), await browser('msedge')];
+  const without = brokerClient({ sessionId: 'ctl-none', port: PORT, dir });
+  clients.push(without);
+  await assert.rejects(without.tabs('http://one.test'), /Say which browser/);
+  const named = brokerClient({ sessionId: 'ctl-named', port: PORT, dir, browser: 'msedge' });
+  clients.push(named);
+  assert.deepEqual((await named.tabs('http://one.test')).map(t => t.id), [1]);
+  chrome.close(); edge.close(); await sleep(150);
+});
+
 test('several connected, no name, default missing, unknown or not connected: fails listing the connected browsers', async () => {
   const [chrome, edge] = [await browser('chrome'), await browser('msedge')];
   for (const dflt of [undefined, () => undefined, () => 'brave', () => { throw new Error('registry unreadable'); }]) {
