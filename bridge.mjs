@@ -1,0 +1,387 @@
+// Local CDP relay. Playwright connects to ws://127.0.0.1:<port>/cdp?t=<token>&s=<session id> and speaks plain CDP;
+// the Local Browser Bridge extension (extension/) connects to /extension and exposes chrome.debugger / chrome.tabs.
+// This module translates between them. Tab-level model after Playwright MCP's own extension relay, with one change:
+// only tabs the user has looked at are attached, never all of them.
+// Several sessions (one per Claude session) can be connected at once. Chromium allows one debugger per tab, so a tab
+// belongs to at most one session; a session's tabs are released when it disconnects.
+import http from 'node:http';
+import { randomBytes } from 'node:crypto';
+import { WebSocketServer, WebSocket } from 'ws';
+
+// Fixed by the "key" in extension/manifest.json, so the origin of its socket can be checked.
+export const EXTENSION_ID = 'nbjcgjmkbnkpjjkglddgcmmnknfdeade';
+const SESSION_ID = /^[\w-]{1,64}$/;
+const usable = ts => ts.filter(t => /^https?:|^about:blank$/.test(t.url || ''));
+
+export function startBridge({ port = 9340, log = () => {}, captureMs = {} } = {}) {
+  const CAP = { real: 8000, nudgeEvery: 500, nudge: 1000, shown: 8000, ...captureMs }; // deadlines of the capture steps (ms)
+  const NOT_PAINTED = 'The browser paints nothing for this tab right now: it is in the background, or another window is covering the browser window, or the window is minimized (a browser cannot paint what nobody can see). Read the page with get_page_text or read_page, or ask the user to bring the browser window to the front. BROWSER_REVEAL_TABS=1 lets this tool show the tab for a moment instead, at the price of a flicker.';
+  let ext = null, extSeen = 0; // the extension pings every 20 s; a live one is never replaced, so a local impostor cannot take its slot
+  const token = randomBytes(16).toString('hex');
+  const startedAt = Date.now();
+  const pending = new Map();
+  let lastId = 0;
+  const sessions = new Map(); // session id -> Session
+  const owners = new Map();   // tab id -> { session, until? }  (until: a release in progress)
+  const byTabSession = new Map(); // bridge session id ("bridge-tab-N") -> Session, to say who owns a tab a client names
+  let nextTabSession = 1;
+
+  // Every extension call gets a deadline: a hung chrome.debugger call must surface as an error, never as a stuck client.
+  const call = (method, params, ms = 15000) => new Promise((resolve, reject) => {
+    if (ext?.readyState !== WebSocket.OPEN) return reject(new Error('The browser extension is not connected.'));
+    const id = ++lastId;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out after ${ms / 1000}s in the browser.`)); }, ms);
+    pending.set(id, { resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); reject(e); } });
+    ext.send(JSON.stringify({ id, method, params }));
+  });
+  const ownedBy = tabId => new Error(`Tab ${tabId} is owned by another Claude session.`);
+
+  class Session {
+    tabs = new Map(); // tabId -> { tabId, sessionId, targetInfo, childSessions }
+    auto = false;
+    offered = new Set(); // tab ids the user has looked at; the only ones this session may attach
+    attaching = new Map();
+    closed = false;
+    constructor(id, ws) { this.id = id; this.ws = ws; }
+    toClient(m) { if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m)); }
+
+    async command(method, params, sessionId) {
+      switch (method) {
+        case 'Browser.getVersion': return { protocolVersion: '1.3', product: 'Chrome/Local-Browser-Bridge', userAgent: 'Local-Browser-Bridge/1.0' };
+        case 'Browser.setDownloadBehavior': return {};
+        case 'Target.setAutoAttach':
+          if (sessionId) break; // a tab's own child auto-attach goes to the browser
+          this.auto = true;
+          if (this.tabs.size) return {}; // a later call must not grab tabs the user left unclaimed
+          const failures = [];
+          await Promise.all([...this.offered].map(id => this.attach(id).catch(e => { log('attach failed', id, e.message); failures.push(e.message); })));
+          // Attached with no tab is fine when there is no web page to take (the tab in front is a browser page such as the
+          // new-tab page, or it is owned by another session): the session opens its own with createTarget. A tab that exists
+          // and could not be attached for another reason is an error with that reason.
+          if (!this.tabs.size && this.offered.size && !(failures.length === this.offered.size && failures.every(m => /owned by another Claude session/.test(m))))
+            throw new Error(`The tab the user is looking at could not be attached: ${failures.join('; ')}`);
+          return {};
+        case 'Target.attachToTarget':
+        case 'Target.attachToBrowserTarget': throw new Error('Not supported by the Local Browser Bridge: tabs are attached through Target.setAutoAttach, and only the ones this session owns.');
+        case 'Target.createTarget': {
+          const tab = await call('chrome.tabs.create', [{ url: params?.url || 'about:blank', active: false }]); // never pull the user off the tab they are on
+          this.offered.add(tab.id);
+          try { return { targetId: (await this.attach(tab.id, { url: params?.url || 'about:blank' })).targetInfo.targetId }; }
+          catch (e) { await call('chrome.tabs.remove', [tab.id]).catch(() => {}); throw e; } // no half-made tab left unowned
+        }
+        case 'Target.closeTarget': {
+          const s = [...this.tabs.values()].find(t => t.targetInfo?.targetId === params?.targetId);
+          if (!s) return { success: false };
+          await call('chrome.tabs.remove', [s.tabId]);
+          return { success: true };
+        }
+        case 'Target.getTargetInfo': return sessionId ? [...this.tabs.values()].find(t => t.sessionId === sessionId)?.targetInfo : undefined;
+      }
+      if (method === 'Page.captureScreenshot') return this.capture(sessionId, params);
+      return call('chrome.debugger.sendCommand', [this.target(method, sessionId), method, params]);
+    }
+
+    // One capture of a tab, the way the official Claude extension does it (read from its code): the whole viewport from the
+    // surface, never a clip and never past the viewport (those make the browser resize the page while it captures, and a
+    // capture that never ends leaves the page shrunken). A browser paints nothing for a tab nobody can see, so while the
+    // capture is unanswered a tiny throw-away capture is sent every half second until it is answered or its deadline passes: it asks the browser for a frame
+    // of that tab without showing it. Nothing is activated and no window is restored, so the user is never interrupted.
+    // BROWSER_REVEAL_TABS=1 adds the old last resort: show the tab (no focus), capture, put the user's tab back.
+    async capture(sessionId, params) {
+      const target = this.target('Page.captureScreenshot', sessionId);
+      const take = (p, ms) => call('chrome.debugger.sendCommand', [target, 'Page.captureScreenshot', p], ms);
+      const { clip, ...rest } = params ?? {};
+      const whole = { ...rest, fromSurface: true, captureBeyondViewport: false };
+      const real = take(whole, CAP.real);
+      let answered = false;
+      real.then(() => { answered = true; }, () => { answered = true; });
+      void (async () => { // ends when the capture is answered or its deadline passes
+        while (true) {
+          await new Promise(r => setTimeout(r, CAP.nudgeEvery));
+          if (answered) return;
+          await take({ format: 'jpeg', quality: 1, fromSurface: true, captureBeyondViewport: false }, CAP.nudge).catch(() => {});
+        }
+      })();
+      try { return await real; }
+      catch (e) {
+        if (!/timed out/.test(e.message)) throw e;
+        if (process.env.BROWSER_REVEAL_TABS !== '1') throw new Error(NOT_PAINTED);
+        const shown = await call('agent.reveal', [target.tabId]);
+        try { await new Promise(r => setTimeout(r, 250)); return await take(whole, CAP.shown); } // let the browser paint a frame
+        catch (e2) { throw /timed out/.test(e2.message) ? new Error(NOT_PAINTED) : e2; }
+        finally { await call('agent.hide', [shown]).catch(() => {}); }
+      }
+    }
+
+    // No sessionId = browser-level command: route through any attached tab. A tab session maps to its tabId;
+    // a child session (worker, out-of-process iframe) keeps its id so chrome.debugger can route it.
+    target(method, sessionId) {
+      if (!sessionId) {
+        const first = this.tabs.values().next().value;
+        if (!first) throw new Error(`No attached tab to run browser-level command ${method}`);
+        return { tabId: first.tabId };
+      }
+      const tab = [...this.tabs.values()].find(t => t.sessionId === sessionId);
+      if (tab) return { tabId: tab.tabId };
+      const parent = [...this.tabs.values()].find(t => t.childSessions.has(sessionId));
+      if (parent) return { tabId: parent.tabId, sessionId };
+      const other = byTabSession.get(sessionId);
+      if (other && other !== this) throw new Error('That tab is owned by another Claude session.');
+      throw new Error(`No tab for sessionId ${sessionId}`);
+    }
+
+    // A tab belongs to one session. One being released by its previous owner is waited for; any other owner is an error.
+    async claim(tabId) {
+      for (;;) {
+        const o = owners.get(tabId);
+        if (!o) break;
+        if (o.session === this) return;
+        if (!o.until) throw ownedBy(tabId);
+        await o.until;
+      }
+      if (this.closed) throw new Error('The session was closed.');
+      owners.set(tabId, { session: this });
+    }
+
+    // Concurrent callers (createTarget and the tab-activated event for the same new tab) share one attach.
+    attach(tabId, opts) {
+      const have = this.tabs.get(tabId);
+      if (have) return Promise.resolve(have);
+      if (!this.attaching.has(tabId)) this.attaching.set(tabId, this.attachOnce(tabId, opts).finally(() => this.attaching.delete(tabId)));
+      return this.attaching.get(tabId);
+    }
+
+    async attachOnce(tabId, { url } = {}) {
+      await this.claim(tabId);
+      let debuggerOn = false;
+      // The client may drop at any await below: a closed session must end with no owner and no debugger on the tab.
+      const alive = () => { if (this.closed) throw new Error('The session was closed.'); };
+      try {
+        alive();
+        // A debugger left over from our own previous session is released and retaken; one held by DevTools stays an error.
+        await call('chrome.debugger.attach', [{ tabId }, '1.3']).catch(async e => {
+          if (!/already attached/i.test(e.message)) throw e;
+          await call('chrome.debugger.detach', [{ tabId }]).catch(() => {});
+          await call('chrome.debugger.attach', [{ tabId }, '1.3']);
+        });
+        debuggerOn = true;
+        alive();
+        let { targetInfo } = await call('chrome.debugger.sendCommand', [{ tabId }, 'Target.getTargetInfo']);
+        alive();
+        // Vivaldi makes a tab for chrome.tabs.create but leaves it empty (the url is ignored, nothing answers Page.enable
+        // or Runtime.evaluate): load the requested url ourselves, before the client starts talking to the tab.
+        if (url && !targetInfo.url) {
+          await call('chrome.debugger.sendCommand', [{ tabId }, 'Page.navigate', { url }]);
+          targetInfo = { ...targetInfo, url };
+          alive();
+        }
+        const s = { tabId, sessionId: `bridge-tab-${nextTabSession++}`, targetInfo, childSessions: new Set() };
+        this.tabs.set(tabId, s);
+        byTabSession.set(s.sessionId, this);
+        this.toClient({ method: 'Target.attachedToTarget', params: { sessionId: s.sessionId, targetInfo: { ...targetInfo, attached: true }, waitingForDebugger: false } });
+        return s;
+      } catch (e) {
+        if (debuggerOn) await call('chrome.debugger.detach', [{ tabId }]).catch(() => {});
+        if (owners.get(tabId)?.session === this) owners.delete(tabId);
+        throw e;
+      }
+    }
+
+    detach(tabId) {
+      const s = this.tabs.get(tabId);
+      if (!s) return;
+      this.tabs.delete(tabId);
+      byTabSession.delete(s.sessionId);
+      if (owners.get(tabId)?.session === this) owners.delete(tabId);
+      this.toClient({ method: 'Target.detachedFromTarget', params: { sessionId: s.sessionId, targetId: s.targetInfo?.targetId } });
+    }
+
+    // The client went away: release every tab. Ownership stays until the debugger is really detached, so the
+    // next session that wants the tab waits for the release instead of failing.
+    release() {
+      if (this.closed) return;
+      this.closed = true;
+      if (sessions.get(this.id) === this) sessions.delete(this.id);
+      for (const [tabId, s] of this.tabs) {
+        byTabSession.delete(s.sessionId);
+        const o = owners.get(tabId);
+        if (o?.session !== this) continue;
+        o.until = call('chrome.debugger.detach', [{ tabId }]).catch(() => {}).finally(() => { if (owners.get(tabId) === o) owners.delete(tabId); });
+      }
+      this.tabs.clear();
+    }
+  }
+
+  // A tab the page of an owned tab opened (target=_blank, window.open) belongs to the session that owns the opener,
+  // at once: otherwise it would sit unclaimed, out of reach of the agent that caused it. Needs openerTabId from the extension.
+  const claimOpened = tab => {
+    const owner = tab?.openerTabId !== undefined && owners.get(tab.openerTabId)?.session;
+    if (!owner || owner.closed || owners.has(tab.id)) return false;
+    owner.offered.add(tab.id);
+    owner.attach(tab.id).catch(e => log('attach of an opened tab failed', tab.id, e.message));
+    return true;
+  };
+
+  function onEvent({ method, params }) {
+    switch (method) {
+      case 'chrome.tabs.onCreated': claimOpened(params?.[0]); break;
+      case 'chrome.tabs.onActivated': {
+        const [tab] = params ?? [];
+        if (!tab) break;
+        if (claimOpened(tab)) break;
+        for (const s of sessions.values()) s.offered.add(tab.id);
+        // Only a session that owns no tab takes it (the oldest first); with every session busy it stays unclaimed.
+        const free = [...sessions.values()].find(s => s.auto && s.tabs.size === 0 && s.attaching.size === 0);
+        if (free && !owners.has(tab.id)) free.attach(tab.id).catch(e => log('attach failed', tab.id, e.message));
+        break;
+      }
+      case 'chrome.tabs.onRemoved':
+        if (params?.[0] === undefined) break;
+        for (const s of sessions.values()) s.offered.delete(params[0]);
+        owners.get(params[0])?.session.detach(params[0]);
+        break;
+      case 'chrome.debugger.onDetach': if (params?.[0]?.tabId !== undefined) owners.get(params[0].tabId)?.session.detach(params[0].tabId); break;
+      case 'chrome.debugger.onEvent': {
+        const [source, m, p] = params ?? [];
+        const owner = source && owners.get(source.tabId)?.session;
+        const s = owner?.tabs.get(source.tabId);
+        if (!s) break;
+        if (m === 'Target.attachedToTarget' && p?.sessionId) s.childSessions.add(p.sessionId);
+        else if (m === 'Target.detachedFromTarget' && p?.sessionId) s.childSessions.delete(p.sessionId);
+        // A reply goes through a few promise hops before it is sent; an event is sent at once. Without a pause an event the
+        // browser produced AFTER a reply can overtake it when both arrive in one burst, and Playwright then drops it.
+        const msg = { sessionId: source.sessionId || s.sessionId, method: m, params: p };
+        setImmediate(() => owner.toClient(msg));
+        break;
+      }
+    }
+  }
+
+  function onExtension(ws) {
+    if (ext?.readyState === WebSocket.OPEN && Date.now() - extSeen < 45000) return ws.close(1008, 'extension already connected');
+    ext?.close(1000, 'replaced by a newer extension connection');
+    ext = ws;
+    extSeen = Date.now();
+    for (const s of sessions.values()) s.offered.clear();
+    ws.on('error', () => {});
+    ws.on('message', data => {
+      extSeen = Date.now();
+      let m;
+      try { m = JSON.parse(data.toString()); } catch { return; } // one bad frame must not take the broker down
+      try {
+        if (m.id) {
+          const p = pending.get(m.id);
+          pending.delete(m.id);
+          if (p) m.error ? p.reject(new Error(m.error)) : p.resolve(m.result);
+        } else onEvent(m);
+      } catch (e) { log('bad extension message:', e.message); }
+    });
+    ws.on('close', () => {
+      if (ext !== ws) return; // a replaced socket must not fail the new connection's calls
+      ext = null;
+      for (const s of sessions.values()) s.ws.close(1000, 'extension disconnected');
+      for (const p of pending.values()) p.reject(new Error('The browser extension disconnected.'));
+      pending.clear();
+    });
+  }
+
+  async function onCdp(ws, id) {
+    if (!ext) return ws.close(1000, 'extension not connected');
+    // A reconnect with the same id (the old socket's close event may not have arrived yet) replaces the old connection.
+    const old = sessions.get(id);
+    if (old) { old.ws.close(1008, 'replaced by a newer connection with the same session id'); old.release(); }
+    const me = new Session(id, ws);
+    sessions.set(id, me);
+    ws.on('error', () => {});
+    // Registered first: a client that drops during the awaits below must still release its tabs.
+    ws.on('close', () => me.release());
+    // Playwright starts talking the moment the socket opens, so listen now and hold its messages until the session is ready.
+    let ready;
+    const readyP = new Promise(r => { ready = r; });
+    ws.on('message', async data => {
+      await readyP;
+      if (me.closed) return;
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      const { id: msgId, sessionId, method, params } = msg;
+      if (process.env.BRIDGE_TRACE) log('cmd', method, sessionId ?? '');
+      try { me.toClient({ id: msgId, sessionId, result: (await me.command(method, params, sessionId)) ?? {} }); }
+      catch (e) { log('command failed:', method, e.message); me.toClient({ id: msgId, sessionId, error: { message: e.message } }); }
+    });
+    // Only the tab the user is looking at right now is offered to this session.
+    let active = usable(await call('chrome.tabs.query', [{ active: true, lastFocusedWindow: true }]).catch(() => []));
+    if (!active.length) active = usable(await call('chrome.tabs.query', [{ active: true }]).catch(() => [])); // no focused window (headless, minimised)
+    for (const t of active.slice(0, 1)) me.offered.add(t.id); // one tab: with several windows "active" would pick one per window
+    log(`CDP session ${id} connected; tabs offered:`, [...me.offered]);
+    ready();
+  }
+
+  // Control channel: the MCP server of a session asks the broker for things that are not CDP (extension status,
+  // window restore around a capture). Same auth as /cdp; one JSON request per message.
+  const controls = new Set(); // open control sockets: a session that is mid-attach keeps the broker alive
+  function onControl(ws) {
+    controls.add(ws);
+    ws.on('close', () => controls.delete(ws));
+    ws.on('error', () => {});
+    const methods = {
+      status: () => ({ connected: true, extension: ext?.readyState === WebSocket.OPEN, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
+      // Tabs the user has looked at that no session owns: shown to the agent, never attached without a free session.
+      // Only origin and path leave the broker: a query string or fragment often carries tokens.
+      unclaimed: async () => {
+        const ids = new Set();
+        for (const s of sessions.values()) for (const id of s.offered) if (!owners.has(id)) ids.add(id);
+        if (!ids.size) return [];
+        return (await call('chrome.tabs.query', [{}])).filter(t => ids.has(t.id)).flatMap(t => {
+          try { const u = new URL(t.url); return /^https?:$/.test(u.protocol) ? [{ id: t.id, url: u.origin + u.pathname }] : []; } catch { return []; }
+        });
+      },
+    };
+    // For the cross-browser matrix runner: the tabs under one url prefix with their owner (origin and path only; without a
+    // prefix nothing, so the whole browser is never listed), and the extension's reveal/hide, the same steps a capture of
+    // a background tab uses to show a tab without taking focus.
+    methods.tabs = async prefix => !prefix ? [] : (await call('chrome.tabs.query', [{}])).flatMap(t => {
+      try { const u = new URL(t.url); const url = u.origin + u.pathname; return /^https?:$/.test(u.protocol) && url.startsWith(prefix) ? [{ id: t.id, active: !!t.active, windowId: t.windowId, url, owner: owners.get(t.id)?.session.id ?? null }] : []; } catch { return []; }
+    });
+    methods.reveal = tabId => call('agent.reveal', [tabId]);
+    methods.hide = shown => call('agent.hide', [shown]);
+    ws.on('message', async raw => {
+      let req;
+      try { req = JSON.parse(raw.toString()); } catch { return; }
+      const { id, method, params = [] } = req;
+      try {
+        if (!Object.hasOwn(methods, method)) throw new Error(`Unknown control method ${method}`);
+        ws.send(JSON.stringify({ id, result: (await methods[method](...params)) ?? null }));
+      } catch (e) { ws.send(JSON.stringify({ id, error: String(e.message ?? e) })); }
+    });
+  }
+
+  const server = http.createServer((q, r) => { r.statusCode = 404; r.end(); });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    const deny = () => { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); };
+    // Host first, and a request line that is not a URL is just denied: nothing before the checks may throw.
+    if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host)) return deny();
+    let url;
+    try { url = new URL(req.url, 'http://x'); } catch { return deny(); }
+    const path = url.pathname;
+    const sid = url.searchParams.get('s') ?? '';
+    // A web page always sends an Origin header, so only the extension (by id) or an origin-less local client gets in.
+    // The local client must also know the broker's token, so web pages and other users of this PC cannot drive the browser.
+    const ok = ((path === '/extension' && req.headers.origin === `chrome-extension://${EXTENSION_ID}`)
+      || ((path === '/cdp' || path === '/control') && req.headers.origin === undefined && url.searchParams.get('t') === token && SESSION_ID.test(sid)));
+    if (!ok) return deny();
+    wss.handleUpgrade(req, socket, head, ws => (path === '/extension' ? onExtension(ws) : path === '/cdp' ? onCdp(ws, sid) : onControl(ws)));
+  });
+  const listening = new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
+
+  return {
+    listening,
+    port,
+    cdpEndpoint: (sid = 'default') => `ws://127.0.0.1:${port}/cdp?t=${token}&s=${sid}`,
+    extensionConnected: () => ext?.readyState === WebSocket.OPEN,
+    sessionCount: () => sessions.size,
+    busy: () => sessions.size + controls.size > 0, // a session attached, or one that is talking to us right now
+    token,
+    close: () => { for (const c of wss.clients) c.terminate(); server.close(); server.closeAllConnections?.(); },
+  };
+}

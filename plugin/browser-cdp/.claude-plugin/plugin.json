@@ -1,0 +1,8 @@
+{
+  "name": "browser-cdp",
+  "description": "Drive Chrome, Vivaldi, Edge or Brave with the same tools as the Claude in Chrome extension, behind a URL policy. Controls the browser you already have open through the Local Browser Bridge extension (browser_attach), or launches its own (browser_launch). No Claude account needed.",
+  "version": "1.0.0",
+  "author": {
+    "name": "local-claude-browser-manager"
+  }
+}

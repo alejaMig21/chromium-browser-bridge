@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "browser-local",
+  "description": "Local marketplace for browser-cdp, a Claude-in-Chrome-compatible browser toolset that needs no extension and no Claude account.",
+  "owner": {
+    "name": "local-claude-browser-manager"
+  },
+  "plugins": [
+    {
+      "name": "browser-cdp",
+      "description": "Drive Chrome, Vivaldi, Edge or Brave over CDP with the same tools as the Claude in Chrome extension, behind a URL policy.",
+      "version": "1.0.0",
+      "source": "./browser-cdp",
+      "category": "productivity"
+    }
+  ]
+}

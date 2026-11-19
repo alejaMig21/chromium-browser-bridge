@@ -1,0 +1,17 @@
+{
+  "name": "local-claude-browser-manager",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test policy.test.mjs launcher.test.mjs platform.test.mjs matrix.test.mjs bridge.test.mjs bridge.sessions.test.mjs broker.test.mjs",
+    "live": "node live-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "gifenc": "^1.0.3",
+    "playwright-core": "^1.50.0",
+    "pngjs": "^7.0.0",
+    "ws": "^8.23.0",
+    "zod": "^3.24.0"
+  }
+}

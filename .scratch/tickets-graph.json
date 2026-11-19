@@ -1,0 +1,8 @@
+{
+  "tickets": {},
+  "watch": {
+    "kind": "files",
+    "glob": ".scratch/*/issues/*.md"
+  },
+  "syncedAt": 1795074107585
+}
