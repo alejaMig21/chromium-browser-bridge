@@ -22,6 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const policy = loadPolicy(process.env.BROWSER_POLICY ?? join(here, 'policy.json'));
 let cdp = process.env.CDP_ENDPOINT ?? 'http://127.0.0.1:9333';
 let attachedWs = null; // set while attached to a browser the user already had open (never launched or closed by us)
+let attachedName = ''; // the connected-browser name that attachment went to
 // The Local Browser Bridge extension, installed once in the user's own browser, connects here.
 const SESSION_ID = randomUUID(); // this MCP server's identity on the bridge
 // Every Claude session's MCP server shares one broker that owns the bridge port; it is started on first use.
@@ -432,7 +433,8 @@ reg('browser_attach', "Attach to the browser the user ALREADY has open (their re
   const unsupported = browser && /not supported/.test(installGuide(browser, ''));
   if (unsupported) throw new Error(installGuide(browser, '')); // no point waiting for an extension that cannot exist
   // Attaching again must not renumber the tabs or move the work tab: a live attachment is kept as it is.
-  if (attachedWs && work && !work.isClosed() && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
+  // Naming another browser is a switch, not a repeat: it falls through, and disconnect() below releases this session's tabs in the first one.
+  if (attachedWs && work && !work.isClosed() && (!browser || attachedName.includes(browser.toLowerCase())) && await healthy()) return `Already attached to the user's own browser. Tabs in play: ${ctx.pages().length}. Work tab: Tab ID ${ids.get(work)}; it stays your default.`;
   let picked;
   try { picked = await broker.chooseBrowser({ browser, waitMs: Number(process.env.BROWSER_EXT_WAIT_MS ?? 35000) }); }
   catch (e) {
@@ -440,6 +442,7 @@ reg('browser_attach', "Attach to the browser the user ALREADY has open (their re
     throw new Error(`${e.connected.length ? `${e.message} ` : ''}${installGuide(browser, join(here, 'extension'))} If it is installed, make sure the browser is open and this server is running, then call browser_attach again.`);
   }
   await disconnect();
+  attachedName = picked.name;
   attachedWs = broker.cdpEndpoint();
   let c;
   try { c = await connect(); } catch (e) { attachedWs = null; throw e; }
