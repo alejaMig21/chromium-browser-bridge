@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkUrl, loadPolicy } from './policy.mjs';
 import { brokerClient, choiceNote } from './broker-client.mjs';
-import { installGuide } from './platform.mjs';
+import { installGuide, defaultBrowserProgram } from './platform.mjs';
 import { resolveBrowser, launchArgs, startBrowser, findBrowserPid, waitForCdp, waitForPage, cdpUp, isOwned, ownership, killOwned, loadState, saveState, clearState } from './launcher.mjs';
 
 const { GIFEncoder, quantize, applyPalette } = gifenc;
@@ -25,7 +25,7 @@ let attachedWs = null; // set while attached to a browser the user already had o
 // The Local Browser Bridge extension, installed once in the user's own browser, connects here.
 const SESSION_ID = randomUUID(); // this MCP server's identity on the bridge
 // Every Claude session's MCP server shares one broker that owns the bridge port; it is started on first use.
-const broker = brokerClient({ sessionId: SESSION_ID, port: Number(process.env.BROWSER_BRIDGE_PORT ?? 9340), log: (...a) => console.error('[broker-client]', ...a) });
+const broker = brokerClient({ sessionId: SESSION_ID, port: Number(process.env.BROWSER_BRIDGE_PORT ?? 9340), defaultBrowser: defaultBrowserProgram, log: (...a) => console.error('[broker-client]', ...a) });
 const OUT = process.env.BROWSER_OUTPUT ?? join(here, 'output');
 // Everything this server (and the browsers it launches) writes to the temp dir lives under ONE root.
 // Leftovers older than a day are dropped on start; Playwright's per-connection folders on every disconnect and exit.
