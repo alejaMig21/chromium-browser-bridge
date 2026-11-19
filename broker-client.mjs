@@ -31,6 +31,11 @@ export function spawnBroker({ dir, port = 9340 }) {
 // The reply line that says which browser was attached and why.
 export const choiceNote = ({ name, how }) => `Browser: ${name} (${{ requested: 'requested', only: 'the only one connected', default: 'the system default browser' }[how]}).`;
 
+// The text for the connected browsers (rows of the broker's `browsers` request), shared by list_connected_browsers and browser_status.
+export const describeBrowsers = list => list.length
+  ? [`Connected browsers (${list.length}):`, ...list.map(b => `- ${b.name}${b.instance ? ` (id ${b.instance})` : ''}: ${b.program || '(program unknown)'}; active tab: ${b.title ? `"${b.title}"` : '(none)'}; in use: ${b.inUse ? 'yes' : 'no'}`)].join('\n')
+  : 'No browser is connected. Install the Local Browser Bridge extension in the browser the user has open, then call browser_attach.';
+
 // defaultBrowser() answers the system default browser's program name (e.g. "chrome") or nothing; absent = skipped.
 export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log = () => {}, defaultBrowser }) {
   let info = null, ctl = null, chosen = null;
@@ -112,6 +117,7 @@ export function brokerClient({ sessionId, port = 9340, dir = defaultDir(), log =
     cdpEndpoint: () => `ws://127.0.0.1:${info.port}/cdp?t=${info.token}&s=${sessionId}${chosen ? `&b=${encodeURIComponent(chosen)}` : ''}`,
     // Reading state never starts a broker: with none running these report that, instead of resurrecting one.
     status: () => rpc('status', [], { start: false }).catch(() => ({ connected: false })),
+    browsers: () => rpc('browsers', [], { start: false }).catch(() => []),
     unclaimed: () => rpc('unclaimed', [], { start: false }).catch(() => []),
     // For the cross-browser matrix runner only (see bridge.mjs): which tab is whose, and the extension's reveal/hide.
     tabs: prefix => rpc('tabs', [prefix], { start: false }),
