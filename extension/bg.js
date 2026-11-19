@@ -71,6 +71,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => send({ method: '
 chrome.debugger.onDetach.addListener((source, reason) => send({ method: 'chrome.debugger.onDetach', params: [source, reason] }));
 chrome.tabs.onRemoved.addListener(tabId => send({ method: 'chrome.tabs.onRemoved', params: [tabId] }));
 chrome.tabs.onCreated.addListener(t => { if (usable(t)) send({ method: 'chrome.tabs.onCreated', params: [slim(t)] }); });
+chrome.windows.onFocusChanged.addListener(() => sendTitle()); // the active tab is another one when the user moves to another window
 chrome.tabs.onUpdated.addListener((_id, change, t) => { if (change.title && t.active) sendTitle(); });
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   sendTitle();

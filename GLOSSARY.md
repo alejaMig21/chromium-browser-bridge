@@ -3,7 +3,8 @@
 - **Bridge**: the local relay in `bridge.mjs`. It speaks plain CDP to the MCP servers and talks to the extension.
 - **Broker**: the one process (`broker.mjs`) that hosts the bridge and the extension connections for every Claude session. Started on demand, stops when idle.
 - **Connected browser**: one browser, or one profile of a browser, whose extension is connected to the broker. Named after its program (`vivaldi`, `msedge`). A session attaches to exactly one connected browser at a time; different sessions may use different ones.
-- **Instance id**: the random identifier an extension generates once and keeps, so two profiles of the same browser are told apart. Two entries of one name are shown as `chrome-3f9a`; a live entry is replaced only by the same id from the same program, or after 45 s of silence. An extension without an id is a legacy entry named after its program.
+- **Entry**: the broker's record of one connected browser (one extension connection): its program, instance id, title and tab ownership. A live entry is replaced only by the same instance id from the same program, or after 45 s of silence. A **legacy entry** is one whose extension sends no instance id; it is identified by its program.
+- **Instance id**: the random identifier an extension generates once and keeps, so two profiles of the same browser are told apart. Two entries of one name are shown as `chrome-3f9a` (the first four characters of the id).
 - **Session**: one Claude Code session and its MCP server, identified by a random id on the broker.
 - **Owned tab**: a tab one session is attached to; no other session may command it.
 - **Unclaimed tab**: a tab the user looked at that no session owns; listed, never attached without a free session.

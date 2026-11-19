@@ -16,7 +16,7 @@ A browser cannot be named reliably by what it says about itself: Vivaldi announc
 - A session attaches to exactly one connected browser at a time; different sessions may use different ones. `browser_attach` chooses in this order: the browser the agent asked for, the only connected one, the system default browser if it is connected (Windows), otherwise it fails and lists the connected ones. The reply always names the browser it attached to.
 - A browser that is asked for and not connected: while the broker is younger than 45 s (extensions reconnect on their own timers) it waits up to 35 s for it; an older broker fails at once with the connected browsers and the install guide.
 - A live entry is replaced only by a connection with the same instance id from the same program, or after 45 s of silence. A different program claiming a live id is refused.
-- When a browser goes away, only the sessions attached to it are closed; the others keep working and the message is `<name> disconnected. Still connected: <names or none>` (the broker gives it as the close reason; Playwright hides that reason, so `server.mjs` rebuilds the same sentence from the broker's list when a tool fails because the connection dropped). `browser_attach` with another browser switches a session and releases its tabs in the first.
+- When a browser goes away, only the sessions attached to it are closed; the others keep working and the message names the browser that was lost.
 - New read-only tool `list_connected_browsers`: name, program path, instance id when there are several, active tab title, and whether a session is using it.
 - The program that opened a connection is identified on Windows (and tested there). Elsewhere the entry is named `browser` plus its id; with one browser connected everything works as before.
 
@@ -27,3 +27,7 @@ A browser cannot be named reliably by what it says about itself: Vivaldi announc
 - The extension must be updated and reloaded once to announce its instance id; until then it behaves as before.
 - Tab ownership is per browser: a tab id is only unique inside one browser.
 - Not covered yet: operating systems other than Windows for reading the connecting program, and a name chosen by the user for each profile.
+
+Update 2026-11-19: the message is `<name> disconnected. Still connected: <names or none>` (the broker gives it as the close reason; Playwright hides that reason, so `server.mjs` rebuilds the same sentence from the broker's list when a tool fails because the connection dropped). `browser_attach` with another browser switches a session and releases its tabs in the first.
+
+Update 2026-11-19 (review): one matcher (`matchBrowsers` in `platform.mjs`) serves the broker, its client and the MCP server. A request matches the listed name or program name exactly, or `<program>-<first characters of the instance id>` even when the suffix is no longer listed (the sibling profile left), else a name that contains it; the system default browser is matched by exact program name only, so `chromehelper` is never `chrome`. A request that several entries match is refused as ambiguous, with the matches listed. Replacing a silent entry fails the calls still waiting on it at once.
