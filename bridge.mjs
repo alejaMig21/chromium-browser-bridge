@@ -8,7 +8,7 @@ import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { win32 } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { programOfConnection } from './platform.mjs';
+import { programOfConnection, matchBrowsers } from './platform.mjs';
 
 // Fixed by the "key" in extension/manifest.json, so the origin of its socket can be checked.
 export const EXTENSION_ID = 'nbjcgjmkbnkpjjkglddgcmmnknfdeade';
@@ -28,38 +28,37 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
 
   // Everything the broker keeps about one extension connection (one browser). A tab id is only unique inside one entry,
   // so tab ownership lives here. One entry per connected browser: its program (file path, '' when unknown) and instance id.
+  const keyOf = (program, instance) => instance ?? `legacy:${program}`; // a legacy extension (no id) is identified by its program
   const makeEntry = (program, instance) => {
-    const e = {
-      program, instance, key: instance ?? `legacy:${program}`, // a legacy extension (no id) is identified by its program
+    const entry = {
+      program, instance, key: keyOf(program, instance),
       ext: null, extSeen: 0, // the extension pings every 20 s; a live one is never replaced, so a local impostor cannot take its slot
       pending: new Map(), lastId: 0,
       owners: new Map(), // tab id -> { session, until? }  (until: a release in progress)
       // Every extension call gets a deadline: a hung chrome.debugger call must surface as an error, never as a stuck client.
       call: (method, params, ms = 15000) => new Promise((resolve, reject) => {
-        if (e.ext?.readyState !== WebSocket.OPEN) return reject(new Error('The browser extension is not connected.'));
-        const id = ++e.lastId;
-        const timer = setTimeout(() => { e.pending.delete(id); reject(new Error(`${method} timed out after ${ms / 1000}s in the browser.`)); }, ms);
-        e.pending.set(id, { resolve: v => { clearTimeout(timer); resolve(v); }, reject: err => { clearTimeout(timer); reject(err); } });
-        e.ext.send(JSON.stringify({ id, method, params }));
+        if (entry.ext?.readyState !== WebSocket.OPEN) return reject(new Error('The browser extension is not connected.'));
+        const id = ++entry.lastId;
+        const timer = setTimeout(() => { entry.pending.delete(id); reject(new Error(`${method} timed out after ${ms / 1000}s in the browser.`)); }, ms);
+        entry.pending.set(id, { resolve: v => { clearTimeout(timer); resolve(v); }, reject: err => { clearTimeout(timer); reject(err); } });
+        entry.ext.send(JSON.stringify({ id, method, params }));
       }),
-      sessions: () => [...sessions.values()].filter(s => s.entry === e),
+      sessions: () => [...sessions.values()].filter(s => s.entry === entry),
     };
-    return e;
+    return entry;
   };
   const entries = new Map(); // entry key -> entry, the connected browsers in connection order
-  const base = e => (e.program ? win32.basename(e.program, win32.extname(e.program)).toLowerCase() : 'browser');
+  const base = entry => (entry.program ? win32.basename(entry.program, win32.extname(entry.program)).toLowerCase() : 'browser');
   // Two entries with one program name are told apart by the first four characters of their instance id.
-  const nameOf = e => (e.instance && [...entries.values()].filter(o => base(o) === base(e)).length > 1 ? `${base(e)}-${e.instance.slice(0, 4)}` : base(e));
+  const nameOf = entry => (entry.instance && [...entries.values()].filter(o => base(o) === base(entry)).length > 1 ? `${base(entry)}-${entry.instance.slice(0, 4)}` : base(entry));
   const names = () => [...entries.values()].map(nameOf).join(', ');
-  // The entry a client asks for: its exact name, else the one whose name contains the asked one; none or several = nothing.
-  // No choice made: the only connected browser.
-  const resolve = want => {
+  // The entries a client's name means (platform.mjs matchBrowsers). No name: the only connected browser.
+  const find = want => {
     const all = [...entries.values()];
-    if (!want) return all.length === 1 ? all[0] : undefined;
-    const w = want.toLowerCase(), exact = all.filter(e => nameOf(e) === w || base(e) === w);
-    const found = exact.length ? exact : all.filter(e => nameOf(e).includes(w));
-    return found.length === 1 ? found[0] : undefined;
+    if (!want) return all.length === 1 ? all : [];
+    return matchBrowsers(want, all.map(entry => ({ name: nameOf(entry), base: base(entry), instance: entry.instance, entry }))).map(row => row.entry);
   };
+  const resolve = want => { const found = find(want); return found.length === 1 ? found[0] : undefined; }; // none or several = nothing
   const ownedBy = tabId => new Error(`Tab ${tabId} is owned by another Claude session.`);
 
   class Session {
@@ -70,7 +69,7 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     closed = false;
     constructor(id, ws, entry) { this.id = id; this.ws = ws; this.entry = entry; }
     get owners() { return this.entry.owners; }
-    call(...a) { return this.entry.call(...a); }
+    call(...args) { return this.entry.call(...args); }
     toClient(m) { if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m)); }
 
     async command(method, params, sessionId) {
@@ -288,51 +287,53 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
   }
 
   function onExtension(ws, program, instance) {
-    const fresh = makeEntry(program, instance);
-    const e = entries.get(fresh.key) ?? fresh;
+    const entry = entries.get(keyOf(program, instance)) ?? makeEntry(program, instance);
     // A live entry is replaced only by the same instance id from the same program (a service worker restart); a legacy
     // extension has no id to prove anything, and another program claiming a live id is refused and logged.
-    if (e.ext?.readyState === WebSocket.OPEN && Date.now() - e.extSeen < staleMs && (!instance || e.program !== program)) {
-      log(`refused an extension connection claiming ${instance ? `live instance ${instance}` : `live ${e.key}`} from "${program}"`);
+    if (entry.ext?.readyState === WebSocket.OPEN && Date.now() - entry.extSeen < staleMs && (!instance || entry.program !== program)) {
+      log(`refused an extension connection claiming ${instance ? `live instance ${instance}` : `live ${entry.key}`} from "${program}"`);
       return ws.close(1008, 'extension already connected');
     }
-    e.ext?.close(1000, 'replaced by a newer extension connection');
-    e.program = program;
-    e.title = '';
-    entries.set(e.key, e);
-    e.ext = ws;
-    e.extSeen = Date.now();
-    for (const s of e.sessions()) s.offered.clear();
+    entry.ext?.close(1000, 'replaced by a newer extension connection');
+    // The replaced socket's close event is ignored below, so what was waiting on it is failed here, not left to time out.
+    for (const p of entry.pending.values()) p.reject(new Error('The browser extension connection was replaced by a newer one.'));
+    entry.pending.clear();
+    entry.program = program;
+    entry.title = '';
+    entries.set(entry.key, entry);
+    entry.ext = ws;
+    entry.extSeen = Date.now();
+    for (const s of entry.sessions()) s.offered.clear();
     ws.on('error', () => {});
     ws.on('message', data => {
-      e.extSeen = Date.now();
+      entry.extSeen = Date.now();
       let m;
       try { m = JSON.parse(data.toString()); } catch { return; } // one bad frame must not take the broker down
       try {
         if (m.id) {
-          const p = e.pending.get(m.id);
-          e.pending.delete(m.id);
+          const p = entry.pending.get(m.id);
+          entry.pending.delete(m.id);
           if (p) m.error ? p.reject(new Error(m.error)) : p.resolve(m.result);
-        } else onEvent(e, m);
+        } else onEvent(entry, m);
       } catch (err) { log('bad extension message:', err.message); }
     });
     ws.on('close', () => {
-      if (e.ext !== ws) return; // a replaced socket must not fail the new connection's calls
-      e.ext = null;
-      const lost = nameOf(e); // named while it is still listed: its name may carry an instance suffix
-      if (entries.get(e.key) === e) entries.delete(e.key);
+      if (entry.ext !== ws) return; // a replaced socket must not fail the new connection's calls
+      entry.ext = null;
+      const lost = nameOf(entry); // named while it is still listed: its name may carry an instance suffix
+      if (entries.get(entry.key) === entry) entries.delete(entry.key);
       // Only this browser's sessions end; the reason says which browser went away and which are left (a close reason is at most 123 bytes).
-      for (const s of e.sessions()) s.ws.close(1000, `${lost} disconnected. Still connected: ${names() || 'none'}`.slice(0, 120));
-      for (const p of e.pending.values()) p.reject(new Error('The browser extension disconnected.'));
-      e.pending.clear();
+      for (const s of entry.sessions()) s.ws.close(1000, `${lost} disconnected. Still connected: ${names() || 'none'}`.slice(0, 120));
+      for (const p of entry.pending.values()) p.reject(new Error('The browser extension disconnected.'));
+      entry.pending.clear();
     });
   }
 
   async function onCdp(ws, id, want) {
-    const entry = resolve(want);
+    const found = find(want), entry = found.length === 1 ? found[0] : undefined;
     if (!entries.size) return ws.close(1000, 'extension not connected');
     // A close reason is at most 123 bytes.
-    if (!entry) return ws.close(1008, (want ? `no connected browser matches "${want}". Connected: ${names()}` : `several browsers are connected, say which one. Connected: ${names()}`).slice(0, 120));
+    if (!entry) return ws.close(1008, (!want ? `several browsers are connected, say which one. Connected: ${names()}` : found.length ? `"${want}" is ambiguous: it matches ${found.map(nameOf).join(', ')}. Name one of them.` : `no connected browser matches "${want}". Connected: ${names()}`).slice(0, 120));
     // A reconnect with the same id (the old socket's close event may not have arrived yet) replaces the old connection.
     const old = sessions.get(id);
     if (old) { old.ws.close(1008, 'replaced by a newer connection with the same session id'); old.release(); }
@@ -355,8 +356,8 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
       catch (e) { log('command failed:', method, e.message); me.toClient({ id: msgId, sessionId, error: { message: e.message } }); }
     });
     // Only the tab the user is looking at right now is offered to this session.
-    let active = usable(await entry.call('chrome.tabs.query', [{ active: true, lastFocusedWindow: true }]).catch(() => []));
-    if (!active.length) active = usable(await entry.call('chrome.tabs.query', [{ active: true }]).catch(() => [])); // no focused window (headless, minimised)
+    let active = usable(await me.call('chrome.tabs.query', [{ active: true, lastFocusedWindow: true }]).catch(() => []));
+    if (!active.length) active = usable(await me.call('chrome.tabs.query', [{ active: true }]).catch(() => [])); // no focused window (headless, minimised)
     for (const t of active.slice(0, 1)) me.offered.add(t.id); // one tab: with several windows "active" would pick one per window
     log(`CDP session ${id} connected; tabs offered:`, [...me.offered]);
     ready();
@@ -367,24 +368,24 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
   const controls = new Set(); // open control sockets: a session that is mid-attach keeps the broker alive
   function onControl(ws, sid, want) {
     // The browser a request applies to: the one the session is attached to, else the one asked for, else the only one.
-    const e0 = sessions.get(sid)?.entry ?? resolve(want);
+    const chosen = sessions.get(sid)?.entry ?? resolve(want);
     const noEntry = () => new Error(entries.size ? `Say which browser (several are connected: ${names()}).` : 'The browser extension is not connected.');
     // Every method that talks to a browser reads the entry through this: with none to pick it fails instead of guessing.
-    const E = () => { if (!e0) throw noEntry(); return e0; };
+    const needEntry = () => { if (!chosen) throw noEntry(); return chosen; };
     controls.add(ws);
     ws.on('close', () => controls.delete(ws));
     ws.on('error', () => {});
     const methods = {
-      status: () => ({ connected: true, extension: e0 ? e0.ext?.readyState === WebSocket.OPEN : entries.size > 0, browsers: entries.size, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
+      status: () => ({ connected: true, extension: chosen ? chosen.ext?.readyState === WebSocket.OPEN : entries.size > 0, browsers: entries.size, sessions: sessions.size, uptimeMs: Date.now() - startedAt }),
       // The connected browsers, for list_connected_browsers: name, program path, instance id when the name is shared, in use or not.
       browsers: () => [...entries.values()].map(b => ({ name: nameOf(b), program: b.program, ...(b.instance && nameOf(b) !== base(b) ? { instance: b.instance } : {}), title: b.title ?? '', inUse: b.sessions().length > 0 })),
       // Tabs the user has looked at that no session owns: shown to the agent, never attached without a free session.
       // Only origin and path leave the broker: a query string or fragment often carries tokens.
       unclaimed: async () => {
-        const e = E(), ids = new Set();
-        for (const s of e.sessions()) for (const id of s.offered) if (!e.owners.has(id)) ids.add(id);
+        const entry = needEntry(), ids = new Set();
+        for (const s of entry.sessions()) for (const id of s.offered) if (!entry.owners.has(id)) ids.add(id);
         if (!ids.size) return [];
-        return (await e.call('chrome.tabs.query', [{}])).filter(t => ids.has(t.id)).flatMap(t => {
+        return (await entry.call('chrome.tabs.query', [{}])).filter(t => ids.has(t.id)).flatMap(t => {
           try { const u = new URL(t.url); return /^https?:$/.test(u.protocol) ? [{ id: t.id, url: u.origin + u.pathname }] : []; } catch { return []; }
         });
       },
@@ -392,11 +393,11 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
     // For the cross-browser matrix runner: the tabs under one url prefix with their owner (origin and path only; without a
     // prefix nothing, so the whole browser is never listed), and the extension's reveal/hide, the same steps a capture of
     // a background tab uses to show a tab without taking focus.
-    methods.tabs = async prefix => !prefix ? [] : (await E().call('chrome.tabs.query', [{}])).flatMap(t => {
-      try { const u = new URL(t.url); const url = u.origin + u.pathname; return /^https?:$/.test(u.protocol) && url.startsWith(prefix) ? [{ id: t.id, active: !!t.active, windowId: t.windowId, url, owner: E().owners.get(t.id)?.session.id ?? null }] : []; } catch { return []; }
+    methods.tabs = async prefix => !prefix ? [] : (await needEntry().call('chrome.tabs.query', [{}])).flatMap(t => {
+      try { const u = new URL(t.url); const url = u.origin + u.pathname; return /^https?:$/.test(u.protocol) && url.startsWith(prefix) ? [{ id: t.id, active: !!t.active, windowId: t.windowId, url, owner: needEntry().owners.get(t.id)?.session.id ?? null }] : []; } catch { return []; }
     });
-    methods.reveal = tabId => E().call('agent.reveal', [tabId]);
-    methods.hide = shown => E().call('agent.hide', [shown]);
+    methods.reveal = tabId => needEntry().call('agent.reveal', [tabId]);
+    methods.hide = shown => needEntry().call('agent.hide', [shown]);
     ws.on('message', async raw => {
       let req;
       try { req = JSON.parse(raw.toString()); } catch { return; }
@@ -424,13 +425,13 @@ export function startBridge({ port = 9340, log = () => {}, captureMs = {}, ident
       || ((path === '/cdp' || path === '/control') && req.headers.origin === undefined && url.searchParams.get('t') === token && SESSION_ID.test(sid)));
     if (!ok) return deny();
     const want = url.searchParams.get('b') || undefined; // the browser a client asks for, by name
-    const up = (...a) => wss.handleUpgrade(req, socket, head, ws => (path === '/extension' ? onExtension(ws, ...a) : path === '/cdp' ? onCdp(ws, sid, want) : onControl(ws, sid, want)));
-    if (path !== '/extension') return up();
+    const upgrade = (...extensionArgs) => wss.handleUpgrade(req, socket, head, ws => (path === '/extension' ? onExtension(ws, ...extensionArgs) : path === '/cdp' ? onCdp(ws, sid, want) : onControl(ws, sid, want)));
+    if (path !== '/extension') return upgrade();
     // The extension announces its instance id in the url (?i=); a malformed one is treated as none (a legacy extension).
     const id = url.searchParams.get('i'), instance = id && SESSION_ID.test(id) ? id : undefined;
     // Who opened the connection is asked before the handshake completes; a failing lookup means "unknown", never a refusal.
     Promise.resolve().then(() => identify({ req, remoteAddress: socket.remoteAddress, remotePort: socket.remotePort })).catch(() => undefined)
-      .then(program => up(typeof program === 'string' ? program : '', instance));
+      .then(program => upgrade(typeof program === 'string' ? program : '', instance));
   });
   const listening = new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
 

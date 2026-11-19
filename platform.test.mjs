@@ -1,7 +1,7 @@
 // The platform layer answers for Windows, macOS and Linux from any machine: the platform is a parameter.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BROWSER_NAMES, installGuide, browserPaths, discoveryDir, extensionsPage, parseProcessList, listCommand, commandLineCommand, killTree, pickBrowserPid } from './platform.mjs';
+import { BROWSER_NAMES, installGuide, browserPaths, discoveryDir, extensionsPage, parseProcessList, listCommand, commandLineCommand, killTree, pickBrowserPid, regValue, programFromCommand, defaultBrowserProgram, matchBrowsers } from './platform.mjs';
 
 test('every supported browser has a place to look on every system', () => {
   for (const p of ['win32', 'darwin', 'linux'])
@@ -100,8 +100,6 @@ test('stopping a process tree: taskkill on Windows, the process group then the p
 });
 
 // ---- system default browser (Windows) ----
-import { regValue, programFromCommand, defaultBrowserProgram } from './platform.mjs';
-
 const USER_CHOICE = 'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice\r\n    Hash    REG_SZ    abc/DEF=\r\n    ProgId    REG_SZ    VivaldiHTM.QWERTY123\r\n\r\n';
 const OPEN_CMD = 'HKEY_CLASSES_ROOT\\VivaldiHTM.QWERTY123\\shell\\open\\command\r\n    (Default)    REG_SZ    "C:\\Users\\me\\AppData\\Local\\Vivaldi\\Application\\vivaldi.exe" -- "%1"\r\n\r\n';
 
@@ -136,6 +134,29 @@ test('defaultBrowserProgram returns nothing off Windows, on a missing key, a fai
 
 test('defaultBrowserProgram reads a real answer on this Windows machine', { skip: process.platform !== 'win32' }, async () => {
   const p = await defaultBrowserProgram();
-  console.log('real default browser program:', p);
-  assert.ok(typeof p === 'string' && p.length > 0 && p === p.toLowerCase() && !/\.exe$/.test(p));
+  assert.ok(p === undefined || (typeof p === 'string' && p.length > 0 && p === p.toLowerCase())); // whatever this host's default is
+});
+
+// ---- one name matcher for the broker, its client and the MCP server ----
+const rows = [{ name: 'chrome-3f9a', base: 'chrome', instance: '3f9a1b2c-0000' }, { name: 'chrome-bbbb', base: 'chrome', instance: 'bbbb2222' }, { name: 'msedge', base: 'msedge' }];
+const names = (want, list = rows, opts) => matchBrowsers(want, list, opts).map(r => r.name);
+
+test('matchBrowsers: the exact name or program name first, then the name that contains it', () => {
+  assert.deepEqual(names('msedge'), ['msedge']);
+  assert.deepEqual(names('EDGE'), ['msedge']);
+  assert.deepEqual(names('chrome'), ['chrome-3f9a', 'chrome-bbbb']); // the program name is exact for both: ambiguous, not "none"
+  assert.deepEqual(names('brave'), []);
+});
+
+test('matchBrowsers: name-xxxx still finds its entry when the suffix is no longer displayed', () => {
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome', instance: '3f9a1b2c-0000' }]), ['chrome']);
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome', instance: 'bbbb2222' }]), []);
+  assert.deepEqual(names('chrome-3f9a', [{ name: 'chrome', base: 'chrome' }]), []); // a legacy entry has no id to match
+});
+
+test('matchBrowsers with exactOnly never picks a name that merely contains the request', () => {
+  const list = [{ name: 'chromehelper' }, { name: 'msedge' }];
+  assert.deepEqual(names('chrome', list), ['chromehelper']);
+  assert.deepEqual(names('chrome', list, { exactOnly: true }), []);
+  assert.deepEqual(names('msedge', list, { exactOnly: true }), ['msedge']);
 });

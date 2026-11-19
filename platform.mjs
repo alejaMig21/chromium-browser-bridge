@@ -7,6 +7,25 @@ import { homedir } from 'node:os';
 
 export const BROWSER_NAMES = ['chrome', 'edge', 'brave', 'opera', 'vivaldi', 'chromium'];
 
+// The one place that decides which connected browsers a requested name means. `rows` are { name (as listed), base? (the
+// program name, default = name), instance? (id) }. Matches, in order: the listed or program name exactly, or "<program>-<first
+// characters of the instance id>" (a name shown with a suffix still finds its entry after the sibling profile left and the
+// suffix is no longer displayed); else, unless exactOnly, the names that contain the request.
+export function matchBrowsers(want, rows, { exactOnly = false } = {}) {
+  const w = String(want).toLowerCase();
+  const exact = rows.filter(r => {
+    const base = r.base ?? r.name;
+    return r.name === w || base === w || (!!r.instance && w.length > base.length + 1 && w.startsWith(`${base}-`) && r.instance.toLowerCase().startsWith(w.slice(base.length + 1)));
+  });
+  return exact.length || exactOnly ? exact : rows.filter(r => r.name.includes(w));
+}
+
+// The promise's answer, or nothing once `ms` have passed.
+const withTimeout = (promise, ms) => {
+  let timer;
+  return Promise.race([promise, new Promise(r => { timer = setTimeout(r, ms, undefined); })]).finally(() => clearTimeout(timer));
+};
+
 const joinFor = p => (p === 'win32' ? path.win32.join : path.posix.join);
 
 // Candidate executables, best first. The first one that exists is used.
@@ -126,27 +145,21 @@ export function programFromCommand(command) {
 // named like the broker names browsers. Anything else (no key, failure, slow answer, other systems) is nothing.
 export async function defaultBrowserProgram({ run = runCommand, timeoutMs = 2000, platform = process.platform } = {}) {
   if (platform !== 'win32') return undefined;
-  let timer;
-  const lookup = (async () => {
+  return withTimeout((async () => {
     const progId = regValue(await run('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice', '/v', 'ProgId']), 'ProgId');
     if (!progId) return undefined;
     return programFromCommand(regValue(await run('reg', ['query', `HKCR\\${progId}\\shell\\open\\command`, '/ve']), '(Default)'));
-  })().catch(() => undefined);
-  const bound = new Promise(r => { timer = setTimeout(r, timeoutMs, undefined); });
-  try { return await Promise.race([lookup, bound]); } finally { clearTimeout(timer); }
+  })().catch(() => undefined), timeoutMs);
 }
 
 // Which program opened a connection to the bridge: its executable's full path, or nothing. Windows only (netstat for the
 // owning pid, one PowerShell call for the path, about half a second). Any failure, or no answer within timeoutMs, is nothing.
 export async function programOfConnection({ req, remoteAddress, remotePort }, { run = runCommand, timeoutMs = 2000, platform = process.platform } = {}) {
   if (platform !== 'win32' || !remotePort || !/^(::ffff:)?127\./.test(remoteAddress ?? '') && remoteAddress !== '::1') return undefined;
-  let timer;
-  const lookup = (async () => {
+  return withTimeout((async () => {
     const pid = ownerPid(await run('netstat', ['-ano', '-p', 'tcp']), remotePort, req.socket.localPort);
     if (!pid) return undefined;
     const out = await run('powershell', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).Path`]);
     return out.trim() || undefined;
-  })().catch(() => undefined);
-  const bound = new Promise(r => { timer = setTimeout(r, timeoutMs, undefined); });
-  try { return await Promise.race([lookup, bound]); } finally { clearTimeout(timer); }
+  })().catch(() => undefined), timeoutMs);
 }

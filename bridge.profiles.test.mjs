@@ -17,11 +17,11 @@ after(() => { for (const w of opened) w.close(); bridge.close(); });
 const chrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const other = 'C:\\tools\\impostor.exe';
 
-async function browser(program, instance) {
+async function browser(program, instance, silentOn) { // silentOn: a method this fake never answers
   programs.push(program);
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/extension${instance ? `?i=${instance}` : ''}`, { headers: { Origin: `chrome-extension://${EXTENSION_ID}` } });
   opened.push(ws);
-  ws.on('message', d => { const { id } = JSON.parse(d.toString()); ws.send(JSON.stringify({ id, result: null })); });
+  ws.on('message', d => { const { id, method } = JSON.parse(d.toString()); if (method !== silentOn) ws.send(JSON.stringify({ id, result: method === 'chrome.tabs.query' ? [] : null })); });
   ws.on('error', () => {});
   const up = await new Promise(r => { ws.once('open', () => r(true)); ws.once('unexpected-response', () => r(false)); });
   if (!up) return null;
@@ -86,5 +86,58 @@ test('a legacy extension (no id) still connects as one entry, and a live second 
   assert.deepEqual((await listed()).map(x => x.name), ['chrome']);
   assert.equal(await (await browser(chrome)).closed, 'extension already connected');
   a.ws.close();
+  await sleep(100);
+});
+
+// A CDP client asking for a browser by name: 'open', or the close reason the bridge gave.
+async function asks(id, want) {
+  const ws = new WebSocket(`${bridge.cdpEndpoint(id)}&b=${want}`);
+  opened.push(ws);
+  ws.on('error', () => {});
+  const closed = new Promise(r => ws.once('close', (_c, reason) => r(String(reason))));
+  const up = await new Promise(r => { ws.once('open', () => r(true)); ws.once('unexpected-response', () => r(false)); });
+  if (!up) return { reason: 'denied' };
+  const reason = await Promise.race([closed, sleep(300).then(() => 'open')]);
+  return { ws, reason };
+}
+
+test('a name shown with its suffix still finds its entry after the sibling profile left and the suffix is gone', async () => {
+  const a = await browser(chrome, 'aaaa1111'), b = await browser(chrome, 'bbbb2222');
+  assert.equal((await asks('stable-1', 'chrome-aaaa')).reason, 'open');
+  b.ws.close();
+  await sleep(150);
+  assert.deepEqual((await listed()).map(x => x.name), ['chrome']);
+  const again = await asks('stable-2', 'chrome-aaaa'); // the reconnect with the stored name
+  assert.equal(again.reason, 'open');
+  assert.match((await asks('stable-3', 'chrome-bbbb')).reason, /no connected browser matches/); // the gone profile is not it
+  a.ws.close();
+  await sleep(100);
+});
+
+test('a request that several entries match says it is ambiguous and lists them', async () => {
+  const a = await browser(chrome, 'aaaa1111'), b = await browser(chrome, 'bbbb2222');
+  const reason = (await asks('ambig', 'chrome')).reason;
+  assert.match(reason, /ambiguous/);
+  assert.match(reason, /chrome-aaaa/);
+  assert.match(reason, /chrome-bbbb/);
+  a.ws.close(); b.ws.close();
+  await sleep(100);
+});
+
+test('replacing a silent entry rejects the calls waiting on it at once instead of letting them time out', async () => {
+  const a = await browser(chrome, 'aaaa1111', 'agent.reveal'); // never answers a reveal
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/control?t=${token}&s=ctl`);
+  opened.push(ws);
+  await new Promise(r => ws.once('open', r));
+  const reply = new Promise(r => { ws.on('message', d => r(JSON.parse(d.toString()))); });
+  ws.send(JSON.stringify({ id: 1, method: 'reveal', params: [1] }));
+  await sleep(STALE + 150);
+  const t = Date.now();
+  const taker = await browser(other, 'aaaa1111');
+  assert.ok(taker, 'replaced');
+  const got = await Promise.race([reply, sleep(3000).then(() => 'still waiting')]);
+  assert.match(got.error ?? got, /replaced|disconnected/);
+  assert.ok(Date.now() - t < 2000, 'rejected at once, not after the 15 s call deadline');
+  taker.ws.close(); a.ws.close();
   await sleep(100);
 });
