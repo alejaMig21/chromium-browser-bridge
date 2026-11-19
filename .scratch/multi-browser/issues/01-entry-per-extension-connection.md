@@ -15,4 +15,4 @@ Spec: `.scratch/multi-browser/spec.md`. ADR: `docs/adr/0003-several-browsers-on-
 
 ## Answer
 
-Done in `bridge.mjs` (commit 345e382): `makeEntry()` holds `ext`, `extSeen`, `pending`, `lastId`, `owners`, `call()`, `sessions()`; one instance for now; each `Session` has `.entry`. Control requests resolve `sessions.get(sid)?.entry ?? entry`. `byTabSession` stays global (ids `bridge-tab-N` are unique). `status.sessions` and `busy()` still count globally. 77/77 tests, no test edited. Ticket 02 must change `onExtension` and `onCdp` to create and look up entries, and add the two-entries-same-tab-id guard test.
+Done in `bridge.mjs` (commit 4f70ee6): `makeEntry()` holds `ext`, `extSeen`, `pending`, `lastId`, `owners`, `call()`, `sessions()`; one instance for now; each `Session` has `.entry`. Control requests resolve `sessions.get(sid)?.entry ?? entry`. `byTabSession` stays global (ids `bridge-tab-N` are unique). `status.sessions` and `busy()` still count globally. 77/77 tests, no test edited. Ticket 02 must change `onExtension` and `onCdp` to create and look up entries, and add the two-entries-same-tab-id guard test.

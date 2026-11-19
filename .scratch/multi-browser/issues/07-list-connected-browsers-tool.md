@@ -17,7 +17,7 @@ Spec: stories 17, 18, 19, 20, 33 in `.scratch/multi-browser/spec.md`.
 
 ## Answer
 
-Done (commit 3c23000, merged). `describeBrowsers(list)` and `brokerClient.browsers()` in `broker-client.mjs`; `browsers()` never starts a broker and returns `[]` when none runs, so the tool works before any attach. `server.mjs` registers `list_connected_browsers` (no arguments, read-only) and `browser_status` has a `connectedBrowsers` field built with the same formatter. 5 tests in `broker-client.list.test.mjs` (port 9460). Output for two browsers (title in quotes, `(none)` when empty):
+Done (commit 34abdf4, merged). `describeBrowsers(list)` and `brokerClient.browsers()` in `broker-client.mjs`; `browsers()` never starts a broker and returns `[]` when none runs, so the tool works before any attach. `server.mjs` registers `list_connected_browsers` (no arguments, read-only) and `browser_status` has a `connectedBrowsers` field built with the same formatter. 5 tests in `broker-client.list.test.mjs` (port 9460). Output for two browsers (title in quotes, `(none)` when empty):
 
 ```
 Connected browsers (2):

@@ -18,7 +18,7 @@ Spec: stories 1, 5, 13, 15, 29, 30 in `.scratch/multi-browser/spec.md`.
 
 ## Answer
 
-Done in `bridge.mjs` + new `bridge.browsers.test.mjs` (commit 6c1288c). 85/85 tests (77 old untouched, 8 new). Interfaces later tickets use:
+Done in `bridge.mjs` + new `bridge.browsers.test.mjs` (commit 9b5814f). 85/85 tests (77 old untouched, 8 new). Interfaces later tickets use:
 
 - **Program lookup (03):** `startBridge({ identify })`; `identify({ req, remoteAddress, remotePort })` returns a program path string or nothing, may be async, awaited before the handshake completes. A throw or non-string means unknown, entry is named `browser`. Default answers nothing.
 - **Instance id (06):** the extension connects to `/extension?i=<id>`, id matches `[\w-]{1,64}`. Missing or malformed id = legacy entry keyed by program.
